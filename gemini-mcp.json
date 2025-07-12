@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "kite": {
+      "command": "D:/Projects/gemini-cli/ai_trading_agent/.venv/Scripts/python.exe",
+      "args": ["D:/Projects/gemini-cli/ai_trading_agent/src/main.py"],
+      "env": {
+        "APP_MODE": "stdio",
+        "KITE_API_KEY": "bhszyghw4si3tzk4",
+        "KITE_API_SECRET": "u7momerae8zbblj7hjwev4q0xewyvqfr"
+      }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+    "cash": -24.8,
+    "holdings": {
+        "CRIZAC": {
+            "quantity": 0,
+            "entry_price": 0,
+            "instrument_token": 194009601,
+            "stop_loss": 0.0,
+            "take_profit": 0.0,
+            "peak_price": 0
+        }
+    }
+}

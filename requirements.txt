@@ -1,0 +1,8 @@
+kiteconnect
+python-dotenv
+google-generativeai==0.5.4
+gnews
+pandas
+pandas-ta
+python-telegram-bot
+requests
