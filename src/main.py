@@ -439,11 +439,13 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @retry_api_call()
 async def reconcile_portfolio(kite: "AsyncKiteClient") -> str:
+    """
+    Synchronizes the local portfolio with the broker's actual holdings and cash.
+    This function now performs a direct, locked update to prevent data corruption.
+    """
     log.info("--- Starting Portfolio Reconciliation ---")
-    global portfolio
     try:
         log.info("Fetching broker holdings...")
-        # Add timeout to prevent hanging
         broker_holdings = await asyncio.wait_for(kite.holdings(), timeout=30.0)
         log.info(f"Fetched {len(broker_holdings)} holdings from broker")
         
@@ -452,47 +454,53 @@ async def reconcile_portfolio(kite: "AsyncKiteClient") -> str:
         actual_cash = margins["equity"]["available"]["cash"]
         log.info(f"Available cash: ₹{actual_cash:,.2f}")
         
-        async with portfolio_context() as portfolio_data:
-            original_holdings = set(portfolio_data['holdings'].keys())
-            reconciled_portfolio = {"cash": actual_cash, "holdings": {}}
-            summary = []
+        summary = []
+        
+        async with portfolio_lock:
+            # --- Direct Portfolio Update ---
+            original_cash = portfolio.get('cash', 0)
+            if original_cash != actual_cash:
+                summary.append(f"~ Cash updated from ₹{original_cash:,.2f} to ₹{actual_cash:,.2f}")
+                portfolio['cash'] = actual_cash
 
-            for item in broker_holdings:
-                symbol = item['tradingsymbol']
-                log.debug(f"Processing holding: {symbol}")
-                
-                # Update existing holding, ensuring essential fields are present
-                if symbol in portfolio_data['holdings']:
-                    reconciled_portfolio['holdings'][symbol] = portfolio_data['holdings'][symbol]
-                    reconciled_portfolio['holdings'][symbol]['exchange'] = item['exchange'] # Ensure exchange is present
-                    reconciled_portfolio['holdings'][symbol]['product'] = item['product']   # Ensure product is present
-                    
-                    if reconciled_portfolio['holdings'][symbol]['quantity'] != item['quantity']:
-                        summary.append(f"~ {symbol} qty updated to {item['quantity']}")
-                        reconciled_portfolio['holdings'][symbol]['quantity'] = item['quantity']
-                # Add new holding from broker
-                else:
-                    summary.append(f"+ Added new holding: {symbol}")
-                    reconciled_portfolio['holdings'][symbol] = {
-                        "quantity": item['quantity'],
-                        "entry_price": item['average_price'],
-                        "instrument_token": item['instrument_token'],
-                        "exchange": item['exchange'],
-                        "product": item['product'], # Add product type
-                        "stop_loss": item['average_price'] * (1 - (config.RISK_PER_TRADE_PERCENTAGE / 100) * config.ATR_MULTIPLIER),
-                        "take_profit": item['average_price'] * (1 + (config.TAKEPROFIT_ATR_MULTIPLIER * 0.02)),
-                        "peak_price": item['average_price']
-                    }
-            
-            removed_symbols = original_holdings - set(reconciled_portfolio['holdings'].keys())
+            original_holdings = set(portfolio['holdings'].keys())
+            broker_symbols = {item['tradingsymbol'] for item in broker_holdings}
+
+            # Remove sold holdings
+            removed_symbols = original_holdings - broker_symbols
             for symbol in removed_symbols:
                 summary.append(f"- Removed sold holding: {symbol}")
+                del portfolio['holdings'][symbol]
 
-            # Update the global portfolio state
-            portfolio.update(reconciled_portfolio)
-            log.info("Portfolio reconciliation completed successfully")
+            # Add/update holdings
+            for item in broker_holdings:
+                symbol = item['tradingsymbol']
+                if symbol not in original_holdings:
+                    summary.append(f"+ Added new holding: {symbol}")
+                    portfolio['holdings'][symbol] = {} # Create new entry
+                
+                # Update details for both new and existing holdings
+                updated_holding = {
+                    "quantity": item['quantity'],
+                    "entry_price": item['average_price'],
+                    "instrument_token": item['instrument_token'],
+                    "exchange": item['exchange'],
+                    "product": item['product'],
+                    "stop_loss": portfolio['holdings'][symbol].get('stop_loss', item['average_price'] * 0.9), # Sensible default
+                    "take_profit": portfolio['holdings'][symbol].get('take_profit', item['average_price'] * 1.2), # Sensible default
+                    "peak_price": portfolio['holdings'][symbol].get('peak_price', item['average_price'])
+                }
+                
+                # Check for quantity changes on existing holdings
+                if symbol in original_holdings and portfolio['holdings'][symbol].get('quantity') != item['quantity']:
+                    summary.append(f"~ {symbol} qty updated to {item['quantity']}")
+
+                portfolio['holdings'][symbol].update(updated_holding)
+
+            await _save_portfolio_nolock(portfolio)
+            log.info("Portfolio reconciliation and save completed successfully")
         
-        return "✅ Reconciliation Complete:\n" + ("\n".join(f"- {s}" for s in summary) if summary else "- No changes detected.")
+        return "✅ Reconciliation Complete:\n" + ("\n".join(f"  {s}" for s in summary) if summary else "  - No changes detected.")
     
     except asyncio.TimeoutError:
         log.error("Reconciliation timeout - API calls took too long")

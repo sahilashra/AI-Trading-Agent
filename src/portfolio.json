@@ -3,7 +3,7 @@
     "holdings": {
         "CRIZAC": {
             "quantity": 0,
-            "entry_price": 0.0,
+            "entry_price": 0,
             "instrument_token": 194009601,
             "exchange": "NSE",
             "product": "CNC",
