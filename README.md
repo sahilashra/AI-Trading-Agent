@@ -14,12 +14,15 @@ This is a sophisticated, AI-powered swing trading agent designed to operate on t
   - **Dynamic Profit-Taking:** Monitors the RSI of holdings to sell positions when they become overbought, aiming to secure profits near the peak.
   - **Trailing Stop-Loss:** Protects profits by automatically raising the stop-loss as a stock's price increases.
 - **High Reliability & Resilience:**
-  - **Automated Retry Mechanism:** Automatically retries failed API calls to the broker, making the agent resilient to temporary network glitches.
+  - **Circuit Breaker:** Automatically halts API calls to the broker if the service is down, preventing the agent from spamming a failing service and allowing it to recover gracefully.
+  - **Graceful Shutdown:** Shuts down cleanly on `Ctrl+C` or system signals, ensuring all operations are completed and no data is corrupted.
+  - **Automated Retry Mechanism:** Automatically retries failed API calls, making the agent resilient to temporary network glitches.
   - **Order Execution Monitoring (Live Mode):** Tracks the status of every order and only updates the portfolio once the broker confirms it is fully 'COMPLETE'.
   - **Daily Data Cache:** Caches historical data to improve performance and reduce API calls, with an intelligent invalidation system that clears the cache at the start of each new trading day.
 - **Full Telegram Control:**
   - `/start` & `/stop`: Remotely start and stop the agent's trading activity.
-  - `/status`: Get an instant, on-demand summary of your portfolio, including pending orders.
+  - `/status`: Get an instant, on-demand summary of your portfolio.
+  - `/health`: Receive a comprehensive, real-time diagnostic report of the agent's status, including API connectivity, memory usage, and circuit breaker state.
   - `/performance`: Receive a detailed performance report with key metrics.
   - `/trades <query>`: Query the trade history.
 - **State Persistence & Reconciliation:**
@@ -111,7 +114,8 @@ The backtest report will be printed to the console upon completion.
 
 - `/start`: Starts or resumes the agent's trading cycles.
 - `/stop`: Pauses the agent. It will complete any current analysis but will not start a new cycle.
-- `/status`: Provides an instant summary of your portfolio's value, holdings, and pending orders.
+- `/status`: Provides an instant summary of your portfolio's value and holdings.
+- `/health`: Runs a full diagnostic health check on the agent and reports the status of all components.
 - `/performance`: Shows a detailed report of your strategy's historical performance.
 - `/trades <query>`: Shows a log of past trades.
   - `/trades all`: Last 10 trades.
