@@ -23,16 +23,17 @@ def setup_logger():
     # Create a formatter
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
-    # Create a file handler
-    file_handler = logging.FileHandler(log_file)
+    # Create a file handler with UTF-8 encoding
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
 
     # Create a console handler with UTF-8 encoding
-    # Create a console handler
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
+    # This is crucial for Windows environments
+    console_handler.stream.reconfigure(encoding='utf-8')
 
     # Add the handlers to the logger
     logger.addHandler(file_handler)

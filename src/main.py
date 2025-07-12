@@ -4,8 +4,10 @@ import json
 from datetime import datetime, timedelta
 import argparse
 import asyncio
+import time
 import pandas as pd
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor
 
 # --- Load .env first ---
 dotenv_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
@@ -25,623 +27,485 @@ from trade_executor import place_market_order, place_paper_order
 from news_fetcher import get_financial_news
 from technical_analysis import calculate_indicators
 from backtest import run_dynamic_backtest, calculate_backtest_performance, format_backtest_report, plot_performance
-from utils import retry_api_call
+from utils import retry_api_call, AsyncKiteClient
+from errors import CriticalTradingError, MinorTradingError, DataValidationError
+from validators import validate_portfolio_data
+from health_check import health_check
 
-# --- Robust Startup Check ---
-if not os.getenv("GEMINI_API_KEY"):
-    log.critical("CRITICAL: GEMINI_API_KEY not found in .env file. The agent cannot start.")
-    sys.exit(1)
+import pytz
 
-# --- Agent State & Portfolio Initialization ---
-portfolio = {"cash": config.VIRTUAL_CAPITAL, "holdings": {}, "watchlist": {}, "pending_orders": {}}
-AGENT_STATE = {"is_running": True}
-historical_data_cache = {}
+from contextlib import asynccontextmanager
 
-# --- Telegram Command Handlers ---
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_chat.id) != config.TELEGRAM_CHAT_ID:
-        return
-    AGENT_STATE["is_running"] = True
-    await update.message.reply_text("✅ AI Trading Agent has been started.")
+from contextlib import asynccontextmanager
+from state import (
+    AGENT_STATE, portfolio, portfolio_lock, 
+    historical_data_cache, ltp_cache, last_cache_invalidation_date
+)
 
-async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_chat.id) != config.TELEGRAM_CHAT_ID:
-        return
-    AGENT_STATE["is_running"] = False
-    await update.message.reply_text("🛑 AI Trading Agent has been stopped.")
-
-@retry_api_call()
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_chat.id) != config.TELEGRAM_CHAT_ID:
-        return
-    kite = context.bot_data.get('kite')
-    metrics = await get_portfolio_metrics(kite)
-    summary = format_portfolio_summary(metrics)
-    status_text = f"Agent is currently {'RUNNING' if AGENT_STATE['is_running'] else 'PAUSED'}.\n\n{summary}"
-    await update.message.reply_text(status_text)
-
-async def performance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_chat.id) != config.TELEGRAM_CHAT_ID:
-        return
-    log_file = config.TRADE_LOG_FILE if not config.LIVE_PAPER_TRADING else "papertrading_tradelog.csv"
-    metrics = calculate_performance_metrics(log_file)
-    report = format_performance_report(metrics)
-    await update.message.reply_text(report)
-
-async def trades_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_chat.id) != config.TELEGRAM_CHAT_ID:
-        return
-    query = "all"
-    if context.args:
-        query = context.args[0].lower()
-    
-    log_file = config.TRADE_LOG_FILE if not config.LIVE_PAPER_TRADING else "papertrading_tradelog.csv"
-    df = query_trade_log(log_file, query)
-    report = format_trade_log_report(df, query)
-    await update.message.reply_text(report)
-
-# --- Core Agent Functions ---
-def save_portfolio(p_folio):
-    file_path = config.PORTFOLIO_FILE if not config.LIVE_PAPER_TRADING else config.PAPER_PORTFOLIO_FILE
-    try:
-        with open(file_path, 'w') as f:
-            json.dump(p_folio, f, indent=4)
-        log.info(f"Portfolio saved to {file_path}")
-    except Exception as e:
-        log.error(f"Error saving portfolio: {e}")
-
-def load_portfolio():
-    global portfolio
-    file_path = config.PORTFOLIO_FILE if not config.LIVE_PAPER_TRADING else config.PAPER_PORTFOLIO_FILE
-    if os.path.exists(file_path):
+@asynccontextmanager
+async def portfolio_context(save_after=True):
+    """Context manager for safe, atomic portfolio operations."""
+    async with portfolio_lock:
         try:
-            with open(file_path, 'r') as f:
-                loaded_data = json.load(f)
-                portfolio["cash"] = loaded_data.get("cash", config.VIRTUAL_CAPITAL)
-                portfolio["holdings"] = loaded_data.get("holdings", {})
-                portfolio["watchlist"] = loaded_data.get("watchlist", {})
-                portfolio["pending_orders"] = loaded_data.get("pending_orders", {}) # Add this line
-            log.info(f"Portfolio loaded from {file_path}")
-        except Exception as e:
-            log.error(f"Error loading portfolio: {e}. Starting fresh.")
-            portfolio = {"cash": config.VIRTUAL_CAPITAL, "holdings": {}, "watchlist": {}, "pending_orders": {}}
-    else:
-        log.info(f"No portfolio file found at {file_path}. Starting fresh.")
-        portfolio = {"cash": config.VIRTUAL_CAPITAL, "holdings": {}, "watchlist": {}, "pending_orders": {}}
+            yield portfolio
+        finally:
+            if save_after:
+                await _save_portfolio_nolock(portfolio)
 
-@retry_api_call()
-async def reconcile_portfolio(kite: KiteConnect) -> str:
-    log.info("--- Reconciling Portfolio ---")
-    global portfolio
-    try:
-        broker_holdings = kite.holdings()
-        margins = kite.margins()
-        actual_cash = margins["equity"]["available"]["cash"]
-        original_holdings = set(portfolio['holdings'].keys())
-        reconciled_portfolio = {"cash": actual_cash, "holdings": {}}
-        summary = []
 
-        for item in broker_holdings:
-            symbol = item['tradingsymbol']
-            if symbol in portfolio['holdings']:
-                reconciled_portfolio['holdings'][symbol] = portfolio['holdings'][symbol]
-                if reconciled_portfolio['holdings'][symbol]['quantity'] != item['quantity']:
-                    summary.append(f"~ {symbol} qty updated to {item['quantity']}")
-                    reconciled_portfolio['holdings'][symbol]['quantity'] = item['quantity']
-            else:
-                summary.append(f"+ Added new holding: {symbol}")
-                reconciled_portfolio['holdings'][symbol] = {
-                    "quantity": item['quantity'],
-                    "entry_price": item['average_price'],
-                    "instrument_token": item['instrument_token'],
-                    "stop_loss": item['average_price'] * (1 - (config.RISK_PER_TRADE_PERCENTAGE / 100) * config.ATR_MULTIPLIER),
-                    "take_profit": item['average_price'] * (1 + (config.TAKEPROFIT_ATR_MULTIPLIER * 0.02)), # Fallback
-                    "peak_price": item['average_price']
-                }
+# --- Mock/Placeholder Functions (to be implemented properly) ---
+
+def is_market_open():
+    """
+    Checks if the market is open, considering IST timezone and weekdays.
+    """
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist)
+    
+    # Check if it's a weekday (Monday=0, Sunday=6)
+    if now.weekday() >= 5:
+        return False
         
-        removed_symbols = original_holdings - set(reconciled_portfolio['holdings'].keys())
-        for symbol in removed_symbols:
-            summary.append(f"- Removed sold holding: {symbol}")
+    # Check market hours
+    market_open_time = config.MARKET_OPEN
+    market_close_time = config.MARKET_CLOSE
+    
+    return market_open_time <= now.time() <= market_close_time
 
-        portfolio = reconciled_portfolio
-        save_portfolio(portfolio)
-        return "✅ Reconciliation Complete:\n" + ("\n".join(f"- {s}" for s in summary) if summary else "- No changes detected.")
+async def _save_portfolio_nolock(data):
+    """Saves the portfolio data to its file without acquiring the lock."""
+    try:
+        # Use run_in_executor to avoid blocking the event loop with file I/O
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: json.dump(data, open(config.PORTFOLIO_FILE, 'w'), indent=4)
+        )
     except Exception as e:
-        log.error(f"Could not reconcile portfolio: {e}.")
-        raise
+        log.error(f"Error saving portfolio file: {e}")
 
-@retry_api_call()
-async def get_portfolio_metrics(kite: KiteConnect) -> dict:
+
+async def save_portfolio(data):
+    """Saves the portfolio to a JSON file, ensuring thread safety with a lock."""
+    async with portfolio_lock:
+        await _save_portfolio_nolock(data)
+
+async def load_portfolio():
+    """Loads and validates the portfolio from a JSON file."""
     global portfolio
-    holdings_value = 0
-    
-    if portfolio["holdings"]:
-        instrument_lookups = [f"NSE:{pos['instrument_token']}" for pos in portfolio["holdings"].values()]
-        try:
-            ltp_data = kite.ltp(instrument_lookups)
-            for symbol, position in portfolio["holdings"].items():
-                instrument = f"NSE:{position['instrument_token']}"
-                last_price = ltp_data.get(instrument, {}).get('last_price', position['entry_price'])
-                holdings_value += last_price * position['quantity']
-        except Exception as e:
-            log.error(f"Could not fetch LTP for portfolio metrics: {e}.")
-            # In case of API failure, use the last known entry price
-            for position in portfolio["holdings"].values():
-                 holdings_value += position['entry_price'] * position['quantity']
-            raise
+    try:
+        with open(config.PORTFOLIO_FILE, 'r') as f:
+            data = json.load(f)
+        
+        # --- Gracefully handle missing watchlist for backward compatibility ---
+        if 'watchlist' not in data:
+            log.warning("Portfolio file is missing 'watchlist'. Adding a default empty one.")
+            data['watchlist'] = {}
 
-    available_cash = portfolio.get('cash', 0)
-    total_value = available_cash + holdings_value
-    
-    return {
-        "total_value": total_value,
-        "holdings_value": holdings_value,
-        "available_cash": available_cash
-    }
+        # Validate the loaded data
+        validated_portfolio = validate_portfolio_data(data)
+        portfolio = validated_portfolio.dict() # Use the validated and parsed data
+        
+        log.info(f"Portfolio loaded and validated from {config.PORTFOLIO_FILE}")
+
+    except FileNotFoundError:
+        log.warning(f"Portfolio file not found. Starting with an empty portfolio.")
+        portfolio = {"cash": config.VIRTUAL_CAPITAL, "holdings": {}, "watchlist": {}}
+        await save_portfolio(portfolio)
+    except (DataValidationError, json.JSONDecodeError) as e:
+        log.critical(f"Portfolio file is corrupted or invalid: {e}")
+        # This is a critical error, the agent cannot run without a valid portfolio
+        raise CriticalTradingError(f"Could not load a valid portfolio: {e}")
+    except Exception as e:
+        log.critical(f"An unexpected error occurred while loading the portfolio: {e}")
+        raise CriticalTradingError(f"Failed to load portfolio: {e}")
 
 def format_portfolio_summary(metrics: dict) -> str:
-    watchlist_summary = "\n".join([f"  - {s} (Confirm > ₹{d['confirmation_price']:.2f})" for s, d in portfolio.get('watchlist', {}).items()])
-    pending_orders_summary = "\n".join([f"  - {d['action']} {d['symbol']} ({d['quantity']} units)" for o, d in portfolio.get('pending_orders', {}).items()])
     return (
         f"--- Portfolio Summary ---\n"
-        f"💰 Total Value: ₹{metrics['total_value']:,.2f}\n"
-        f"💵 Available Cash: ₹{metrics['available_cash']:,.2f}\n"
-        f"📈 Holdings Value: ₹{metrics['holdings_value']:,.2f}\n"
-        f"⏳ Pending Orders:\n" + (pending_orders_summary if pending_orders_summary else "  - None") + "\n"
-        f"👀 Watchlist:\n" + (watchlist_summary if watchlist_summary else "  - None")
+        f"Total Value:    ₹{metrics.get('total_value', 0):,.2f}\n"
+        f"Holdings Value: ₹{metrics.get('holdings_value', 0):,.2f}\n"
+        f"Available Cash: ₹{metrics.get('available_cash', 0):,.2f}"
     )
 
-@retry_api_call()
-async def monitor_pending_orders(kite: KiteConnect):
+async def get_market_trend(kite: "AsyncKiteClient", from_date=None, to_date=None) -> str:
     """
-    Checks the status of pending orders and updates the portfolio accordingly.
-    This function is for LIVE TRADING ONLY.
+    Determines the market trend based on NIFTY 50's moving average.
     """
-    if not portfolio.get('pending_orders'):
-        return
-
-    log.info(f"--- Checking {len(portfolio['pending_orders'])} Pending Orders ---")
-    for order_id, order_details in list(portfolio['pending_orders'].items()):
-        try:
-            order_history = kite.order_history(order_id=order_id)
-            latest_status = order_history[-1]['status']
-
-            if latest_status == 'COMPLETE':
-                filled_quantity = order_history[-1]['filled_quantity']
-                average_price = order_history[-1]['average_price']
-                
-                log.info(f"✅ Order {order_id} for {order_details['symbol']} COMPLETE.")
-                await send_telegram_alert(f"✅ Order COMPLETE: {order_details['action']} {filled_quantity} of {order_details['symbol']} at avg. ₹{average_price:.2f}")
-
-                # Update portfolio based on the completed trade
-                if order_details['action'] == 'BUY':
-                    if order_details['symbol'] not in portfolio['holdings']:
-                         portfolio['holdings'][order_details['symbol']] = {
-                            "quantity": 0, "entry_price": 0, 
-                            "instrument_token": order_details['instrument_token'], "peak_price": 0
-                         }
-                    
-                    existing_qty = portfolio['holdings'][order_details['symbol']]['quantity']
-                    existing_avg = portfolio['holdings'][order_details['symbol']]['entry_price']
-                    
-                    total_value = (existing_qty * existing_avg) + (filled_quantity * average_price)
-                    total_qty = existing_qty + filled_quantity
-                    
-                    new_avg_price = total_value / total_qty
-                    
-                    portfolio['holdings'][order_details['symbol']]['quantity'] = total_qty
-                    portfolio['holdings'][order_details['symbol']]['entry_price'] = new_avg_price
-                    portfolio['holdings'][order_details['symbol']]['peak_price'] = max(new_avg_price, portfolio['holdings'][order_details['symbol']]['peak_price'])
-                    
-                    portfolio['cash'] -= (filled_quantity * average_price)
-
-                elif order_details['action'] == 'SELL':
-                    pnl = (average_price - portfolio['holdings'][order_details['symbol']]['entry_price']) * filled_quantity
-                    portfolio['cash'] += (filled_quantity * average_price)
-                    portfolio['holdings'][order_details['symbol']]['quantity'] -= filled_quantity
-                    
-                    if portfolio['holdings'][order_details['symbol']]['quantity'] <= 0:
-                        del portfolio['holdings'][order_details['symbol']]
-
-                    with open(config.TRADE_LOG_FILE, 'a', newline='') as f:
-                        f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')},{order_details['symbol']},{order_details['reason']},{filled_quantity},{average_price},{pnl:.2f}\n")
-
-                del portfolio['pending_orders'][order_id]
-
-            elif latest_status in ['REJECTED', 'CANCELLED']:
-                log.warning(f"❌ Order {order_id} for {order_details['symbol']} {latest_status}. Reason: {order_history[-1]['status_message']}")
-                await send_telegram_alert(f"❌ Order {latest_status}: {order_details['action']} {order_details['quantity']} of {order_details['symbol']}. Reason: {order_history[-1]['status_message']}")
-                del portfolio['pending_orders'][order_id]
-
-            else:
-                log.info(f"⏳ Order {order_id} for {order_details['symbol']} is still {latest_status}.")
-
-        except Exception as e:
-            log.error(f"Could not check status for order {order_id}: {e}")
-            raise
-    
-    save_portfolio(portfolio)
-
-
-async def get_cached_historical_data(kite: KiteConnect, instrument_token: int, from_date: datetime.date, to_date: datetime.date, interval: str) -> list:
-    """
-    A wrapper for kite.historical_data that uses a local cache to avoid repeated API calls.
-    """
-    global historical_data_cache
-    cache_key = f"{instrument_token}:{from_date}:{to_date}:{interval}"
-    
-    if cache_key in historical_data_cache:
-        cached_entry = historical_data_cache[cache_key]
-        if (datetime.now() - cached_entry['timestamp']).total_seconds() < config.CACHE_EXPIRY_SECONDS:
-            log.debug(f"CACHE HIT for {cache_key}")
-            return cached_entry['data']
-
-    log.debug(f"CACHE MISS for {cache_key}")
     try:
-        records = kite.historical_data(instrument_token, from_date, to_date, interval)
-        historical_data_cache[cache_key] = {
-            "timestamp": datetime.now(),
-            "data": records
-        }
-        return records
-    except Exception as e:
-        log.error(f"Could not fetch historical data for token {instrument_token}: {e}")
-        return []
+        if from_date is None:
+            from_date = datetime.now() - timedelta(days=90)
+        if to_date is None:
+            to_date = datetime.now()
 
-@retry_api_call()
-async def get_market_trend(kite: KiteConnect) -> str:
-    try:
-        to_date = datetime.now().date()
-        from_date = to_date - timedelta(days=300)
-        nifty_data = await get_cached_historical_data(kite, config.NIFTY_50_TOKEN, from_date, to_date, "day")
+        log.info("Fetching NIFTY 50 historical data...")
+        nifty_data = await kite.historical_data(config.NIFTY_50_TOKEN, from_date, to_date, "day")
         
-        if len(nifty_data) < 200:
-            log.warning("Not enough Nifty 50 data to determine market trend. Defaulting to Uptrend.")
+        if not nifty_data:
+            log.warning("Could not fetch NIFTY 50 data. Defaulting to 'Uptrend'.")
             return "Uptrend"
-            
+
         df = pd.DataFrame(nifty_data)
-        df['sma_200'] = df['close'].rolling(window=200).mean()
+        df['50_sma'] = df['close'].rolling(window=50).mean()
         
         last_close = df['close'].iloc[-1]
-        last_sma = df['sma_200'].iloc[-1]
-        
+        last_sma = df['50_sma'].iloc[-1]
+
         if last_close > last_sma:
             return "Uptrend"
         else:
             return "Downtrend"
             
     except Exception as e:
-        log.error(f"Could not determine market trend: {e}. Defaulting to Uptrend.")
-        return "Uptrend"
+        log.error(f"Error getting market trend: {e}")
+        raise MinorTradingError(f"Could not determine market trend: {e}")
 
-@retry_api_call()
-async def screen_for_momentum_pullbacks(kite: KiteConnect, n: int) -> list:
+async def monitor_pending_orders(kite: "AsyncKiteClient"):
     """
-    Scans for stocks in a strong uptrend that have recently pulled back.
+    Monitors pending orders and handles them (e.g., cancels if not filled).
+    For paper trading, this is less critical as we assume instant fills.
     """
-    log.info(f"--- Screening for Top {n} Momentum Pullback Stocks ---")
     try:
-        all_instruments = kite.instruments(exchange=config.EXCHANGE)
-        nse_equities = [inst for inst in all_instruments if inst['instrument_type'] == 'EQ' and inst['segment'] == 'NSE' and inst.get('name') != 'NIFTYBEES'] # Exclude NiftyBees
+        log.info("--- Monitoring Pending Orders ---")
+        if config.LIVE_PAPER_TRADING:
+            log.info("Paper trading mode: No pending orders to monitor.")
+            return
 
-        candidate_stocks = []
+        pending_orders = await kite.orders()
+        
+        for order in pending_orders:
+            if order['status'] == 'OPEN':
+                log.info(f"Pending order found: {order['tradingsymbol']} {order['transaction_type']} {order['quantity']} @ {order['price']}")
+                # --- Add logic here to handle pending orders, e.g., cancel after a timeout ---
+
+    except Exception as e:
+        log.error(f"Error in monitor_pending_orders: {e}")
+
+async def analyze_and_trade_stock(kite: "AsyncKiteClient", symbol: str, instrument_token: int, is_existing_holding: bool, total_portfolio_value: float):
+    """
+    Analyzes a stock using AI and news, then decides whether to buy, sell, or hold.
+    """
+    try:
+        log.info(f"--- Analyzing {symbol} ---")
+        
+        # 1. Get Historical Data & News
+        from_date = datetime.now() - timedelta(days=90)
+        to_date = datetime.now()
+        
+        historical_data = await kite.historical_data(instrument_token, from_date, to_date, "day")
+        
+        if not historical_data:
+            log.warning(f"No historical data for {symbol}")
+            return
+
+        df = pd.DataFrame(historical_data)
+        df = calculate_indicators(df)
+        
+        news_items = get_financial_news(symbol)
+        
+        # 2. Get AI Analysis
+        ai_decision = await analysis.get_ai_trading_decision(df, news_items, is_existing_holding)
+        
+        log.info(f"AI Decision for {symbol}: {ai_decision['decision']}")
+        await send_telegram_alert(f"AI ({symbol}): {ai_decision['decision']}\nReason: {ai_decision['reason']}")
+
+        # 3. Execute Trade based on AI decision
+        if config.LIVE_PAPER_TRADING:
+            if ai_decision['decision'] == 'BUY':
+                # --- Position Sizing ---
+                cash_to_allocate = portfolio['cash'] * (config.MAX_POSITION_PERCENTAGE / 100)
+                price = df['close'].iloc[-1]
+                quantity = int(cash_to_allocate / price)
+                
+                if quantity > 0:
+                    await place_paper_order(symbol, "BUY", quantity, price)
+                else:
+                    log.warning(f"Not enough cash to buy {symbol}")
+
+            elif ai_decision['decision'] == 'SELL' and is_existing_holding:
+                quantity = portfolio['holdings'][symbol]['quantity']
+                price = df['close'].iloc[-1]
+                await place_paper_order(symbol, "SELL", quantity, price)
+        else:
+            # --- LIVE TRADING LOGIC (not implemented) ---
+            log.warning("Live trading is not yet implemented.")
+
+    except (ConnectionError, asyncio.TimeoutError) as e:
+        # Network-related errors are often transient and should be treated as minor.
+        log.warning(f"Network error while analyzing {symbol}: {e}")
+        raise MinorTradingError(f"Network error analyzing {symbol}: {e}")
+    except Exception as e:
+        log.error(f"An unexpected error occurred in analyze_and_trade_stock for {symbol}: {e}")
+        # Re-raise as a minor error so the main loop can decide how to handle it.
+        # This prevents a single stock from crashing the entire agent.
+        raise MinorTradingError(f"Failed to analyze {symbol}: {e}")
+
+async def manage_watchlist(kite: "AsyncKiteClient", total_portfolio_value: float):
+    """
+    Manages the watchlist: removes old entries and re-analyzes for opportunities.
+    """
+    try:
+        log.info("--- Managing Watchlist ---")
         today = datetime.now().date()
-        from_date = today - timedelta(days=365)
+        
+        async with portfolio_context() as portfolio_data:
+            watchlist_copy = list(portfolio_data["watchlist"].items())
+            
+            for symbol, item in watchlist_copy:
+                # Remove if expired
+                if (today - datetime.strptime(item['added_date'], '%Y-%m-%d').date()).days > config.WATCHLIST_EXPIRY_DAYS:
+                    del portfolio_data["watchlist"][symbol]
+                    log.info(f"Removed expired watchlist item: {symbol}")
+                    continue
+                
+                # Re-analyze to see if it's a buy now
+                log.info(f"Re-analyzing watchlist item: {symbol}")
+                await analyze_and_trade_stock(
+                    kite,
+                    symbol,
+                    item['instrument_token'],
+                    is_existing_holding=False,
+                    total_portfolio_value=total_portfolio_value
+                )
 
-        for i, inst in enumerate(nse_equities):
-            if i >= 200:
-                break
+    except Exception as e:
+        log.error(f"Error in manage_watchlist: {e}")
+        raise MinorTradingError(f"Watchlist management failed: {e}")
+
+async def screen_for_momentum_pullbacks(kite: "AsyncKiteClient", n: int) -> list:
+    """
+    Scans for stocks exhibiting momentum with a recent pullback.
+    """
+    try:
+        log.info(f"Screening top {n} stocks for momentum pullbacks...")
+        # This is a placeholder for a more sophisticated stock screener
+        # In a real scenario, you would use a service like Streak or define a
+        # universe of stocks to scan. For now, we'll use a predefined list.
+        
+        scan_list = []
+        for symbol in config.BACKTEST_STOCKS[:n]:
             try:
-                records = await get_cached_historical_data(kite, inst['instrument_token'], from_date, today, "day")
-                if len(records) < 200:
+                # This is inefficient and should be optimized in a real system
+                instrument = (await kite.instruments(exchange=config.EXCHANGE, tradingsymbol=symbol))[0]
+                
+                from_date = datetime.now() - timedelta(days=100)
+                to_date = datetime.now()
+                
+                data = await kite.historical_data(instrument['instrument_token'], from_date, to_date, "day")
+                
+                if not data:
                     continue
 
-                df = pd.DataFrame(records)
-                df['close'] = pd.to_numeric(df['close'])
-                
-                df['sma_50'] = df['close'].rolling(window=50).mean()
-                df['sma_200'] = df['close'].rolling(window=200).mean()
-                df['high_52_week'] = df['high'].rolling(window=252).max()
+                df = pd.DataFrame(data)
+                df = calculate_indicators(df) # From technical_analysis.py
 
-                last_price = df['close'].iloc[-1]
-                sma_50 = df['sma_50'].iloc[-1]
-                sma_200 = df['sma_200'].iloc[-1]
-                high_52_week = df['high_52_week'].iloc[-1]
-
-                is_uptrend = last_price > sma_50 and last_price > sma_200 and sma_50 > sma_200
-                is_pullback = last_price < high_52_week * 0.95 and last_price > high_52_week * 0.75
-
-                if is_uptrend and is_pullback:
-                    distance_from_high = (high_52_week - last_price) / high_52_week
-                    candidate_stocks.append({
-                        "symbol": inst['tradingsymbol'],
-                        "instrument_token": inst['instrument_token'],
-                        "score": distance_from_high
+                # --- Basic Momentum Pullback Strategy ---
+                # 1. Price is above the 50-day SMA (Uptrend)
+                # 2. RSI is below 50 (Pullback)
+                if df['SMA_50'].iloc[-1] < df['close'].iloc[-1] and df['RSI_14'].iloc[-1] < 50:
+                    scan_list.append({
+                        "symbol": symbol,
+                        "instrument_token": instrument['instrument_token']
                     })
-                    log.info(f"Found candidate: {inst['tradingsymbol']} (Pullback: {distance_from_high:.2%})")
+                    log.info(f"Found potential opportunity: {symbol}")
 
             except Exception as e:
-                log.warning(f"Could not process {inst['tradingsymbol']} for screening: {e}")
+                log.warning(f"Could not screen {symbol}: {e}")
                 continue
-        
-        sorted_candidates = sorted(candidate_stocks, key=lambda x: x['score'])
-        top_stocks = sorted_candidates[:n]
-        
-        log.info(f"Found {len(top_stocks)} potential new stocks to analyze.")
-        return top_stocks
+                
+        return scan_list
 
     except Exception as e:
-        log.error(f"Error screening for momentum pullback stocks: {e}")
+        log.error(f"Error in screen_for_momentum_pullbacks: {e}")
         return []
 
-def create_trading_prompt(market_data: dict, news_headlines: list, indicators: dict, current_trading_symbol: str) -> str:
-    """
-    Creates a specialized prompt for the Gemini model, focusing on a momentum pullback strategy.
-    """
-    prompt = f"""
-    Act as a seasoned technical analyst and swing trader. Your sole focus is on the 'Momentum Pullback' strategy.
-    You will be given data for a stock that is already in a confirmed long-term uptrend but has recently pulled back from its peak.
-    Your task is to determine if this is an optimal entry point ('BUY'), if it's better to wait ('HOLD'), or if the pullback is a sign of a larger reversal ('SELL').
 
-    **Strategy Context:**
-    - **Market Trend:** The overall market is in an Uptrend.
-    - **Stock Status:** The stock is in a long-term uptrend (Price > 50 SMA > 200 SMA) and has pulled back from its 52-week high.
+# --- Telegram Command Handlers ---
 
-    **Analyze the following data for {current_trading_symbol}:**
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /start command."""
+    AGENT_STATE["is_running"] = True
+    log.info("Agent started via /start command.")
+    await update.message.reply_text("✅ Agent has been started.\nTrading loop is now active.")
 
-    **1. Current Price Action:**
-    - Last Price: {market_data.get('last_price')}
-    - Today's Open: {market_data.get('ohlc', {}).get('open')}
-    - Today's High: {market_data.get('ohlc', {}).get('high')}
-    - Today's Low: {market_data.get('ohlc', {}).get('low')}
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /stop command."""
+    AGENT_STATE["is_running"] = False
+    log.info("Agent stopped via /stop command.")
+    await update.message.reply_text("🛑 Agent has been stopped.\nTrading loop is paused. Use /start to resume.")
 
-    **2. Key Technical Indicators:**
-    - **RSI (14):** {indicators.get('rsi_14', 'N/A')} (Is it oversold, neutral, or overbought? Pullbacks to the 40-50 range are often ideal entry points).
-    - **MACD Line:** {indicators.get('macd_line', 'N/A')}
-    - **MACD Signal:** {indicators.get('macd_signal', 'N/A')} (Is there a bullish crossover, or is it trending down?)
-    - **50-Day SMA:** {indicators.get('sma_50', 'N/A')} (Is the price finding support near this key moving average?)
-    - **Bollinger Band Upper:** {indicators.get('bb_upper', 'N/A')}
-    - **Bollinger Band Lower:** {indicators.get('bb_lower', 'N/A')} (Is the price near the lower band, suggesting it's oversold in the short term?)
-    - **ATR (14):** {indicators.get('atr_14', 'N/A')} (This indicates volatility and helps in setting a stop-loss).
-
-    **3. Recent News Headlines (Sentiment Analysis):**
-    - {news_headlines if news_headlines else "No recent news."}
-    (Is the news positive, negative, or neutral? Does it support a continued uptrend?)
-
-    **Your Decision:**
-    Based on a holistic analysis of the data, decide if this pullback offers a high-probability entry point.
-    - **BUY:** If you see strong signs of the pullback ending (e.g., price bouncing off a key SMA, bullish divergence on RSI/MACD, stabilizing price action).
-    - **HOLD:** If the pullback seems to be continuing or if indicators are neutral/conflicting. It's better to wait for a clearer signal.
-    - **SELL:** If you see signs that this is not a minor pullback but a potential trend reversal (e.g., price breaking below the 50-day SMA with high volume, negative news, bearish MACD cross).
-
-    Your final response MUST be a single word: BUY, SELL, or HOLD.
-    """
-    return prompt
-
-async def analyze_and_trade_stock(kite: KiteConnect, symbol: str, token: int, is_holding: bool, total_portfolio_value: float):
-    global portfolio
-    log.info(f"--- Analyzing {'Holding' if is_holding else 'Opportunity'}: {symbol} ---")
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /status command."""
+    kite = context.application.bot_data['kite']
     try:
-        to_date = datetime.now().date()
-        from_date = to_date - timedelta(days=365) # Use 1 year of data for better analysis
-        historical_data = await get_cached_historical_data(kite, token, from_date, to_date, "day")
-        if not historical_data:
-            log.error(f"No historical data for {symbol}.")
-            return
-        
-        indicators = calculate_indicators(historical_data)
-        latest_candle = historical_data[-1]
-        market_data = {"last_price": latest_candle["close"], "ohlc": latest_candle}
-        current_price = market_data["last_price"]
+        async with portfolio_lock:
+            # This might be slow, consider a cached version
+            metrics = await get_portfolio_metrics(kite)
+            summary = format_portfolio_summary(metrics)
 
-        # --- SELL LOGIC (FOR HOLDINGS ONLY) ---
-        if is_holding:
-            position = portfolio["holdings"][symbol]
-            exit_reason = None
-            
-            # RSI based take profit
-            if indicators.get('rsi_14', 50) > 75:
-                exit_reason = "SELL_RSI_TP"
-                await send_telegram_alert(f"🟢 TAKE-PROFIT (RSI) HIT for {symbol} at {current_price:.2f}")
-            
-            # Trailing Stop Loss
-            elif config.USE_TRAILING_STOP_LOSS:
-                if current_price > position.get('peak_price', position['entry_price']):
-                    position['peak_price'] = current_price
-                
-                trailing_stop = position['peak_price'] * (1 - config.TRAILING_STOP_LOSS_PERCENTAGE / 100)
-                if trailing_stop > position['stop_loss']:
-                    position['stop_loss'] = trailing_stop
-                    await send_telegram_alert(f"📈 Trailing SL for {symbol} moved up to {trailing_stop:.2f}")
+        market_status_str = "OPEN" if is_market_open() else "CLOSED"
+        agent_status_str = "RUNNING" if AGENT_STATE["is_running"] else "PAUSED"
 
-            # Stop Loss and Fixed Take Profit
-            if not exit_reason and current_price <= position["stop_loss"]:
-                exit_reason = "SELL_SL"
-                await send_telegram_alert(f"🔴 STOP-LOSS HIT for {symbol} at {position['stop_loss']:.2f}")
-            elif not exit_reason and current_price >= position["take_profit"]:
-                exit_reason = "SELL_TP"
-                await send_telegram_alert(f"🟢 TAKE-PROFIT (Fixed) HIT for {symbol} at {position['take_profit']:.2f}")
-
-            # AI-driven sell
-            if not exit_reason:
-                news_headlines = get_financial_news(query=symbol)
-                prompt = create_trading_prompt(market_data, news_headlines, indicators, symbol)
-                decision = analysis.get_market_analysis(prompt)
-                await send_telegram_alert(f"💡 Gemini's Decision for {symbol}: {decision}")
-                if decision == "SELL":
-                    exit_reason = "SELL_AI"
-
-            if exit_reason:
-                order_id = await place_market_order(kite, symbol, "SELL", position['quantity'])
-                if order_id:
-                    portfolio['pending_orders'][order_id] = {
-                        "symbol": symbol, "action": "SELL", "quantity": position['quantity'], 
-                        "reason": exit_reason, "placed_at": datetime.now().isoformat()
-                    }
-                    save_portfolio(portfolio)
-                    await send_telegram_alert(f"⌛ SELL order for {position['quantity']} of {symbol} placed. Awaiting confirmation.")
-                return # Stop further analysis for this stock
-
-        # --- BUY LOGIC (FOR OPPORTUNITIES ONLY) ---
-        if not is_holding:
-            news_headlines = get_financial_news(query=symbol)
-            prompt = create_trading_prompt(market_data, news_headlines, indicators, symbol)
-            decision = analysis.get_market_analysis(prompt)
-            await send_telegram_alert(f"💡 Gemini's Decision for {symbol}: {decision}")
-
-            if decision == "BUY":
-                confirmation_price = market_data["ohlc"]["high"]
-                portfolio["watchlist"][symbol] = {
-                    "instrument_token": token,
-                    "confirmation_price": confirmation_price,
-                    "added_date": datetime.now().strftime('%Y-%m-%d')
-                }
-                save_portfolio(portfolio)
-                await send_telegram_alert(f"➕ {symbol} added to watchlist. Will buy if price moves above {confirmation_price:.2f}.")
-
+        status_message = (
+            f"--- Agent Status ---\n"
+            f"Agent: {agent_status_str}\n"
+            f"Market: {market_status_str}\n\n"
+            f"{summary}"
+        )
+        await update.message.reply_text(status_message)
     except Exception as e:
-        log.error(f"Error analyzing {symbol}: {e}")
-        await send_telegram_alert(f"🔥 ERROR analyzing {symbol}: {e}")
+        log.error(f"Error in /status command: {e}")
+        await update.message.reply_text(f"❌ Failed to get status: {e}")
 
-async def is_trade_safe(symbol: str, trade_value: float, total_portfolio_value: float) -> bool:
-    """
-    Performs pre-trade risk checks.
-    """
-    # 1. Check for sufficient cash
-    if portfolio['cash'] < trade_value:
-        log.warning(f"TRADE REJECTED: Insufficient cash for {symbol}. Needed: {trade_value:.2f}, Available: {portfolio['cash']:.2f}")
-        await send_telegram_alert(f"⚠️ Trade REJECTED: Insufficient cash for {symbol}.")
-        return False
+async def performance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /performance command."""
+    try:
+        trade_log = await query_trade_log()
+        if not trade_log:
+            await update.message.reply_text("No trades recorded yet.")
+            return
 
-    # 2. Check if the position size exceeds the maximum allowed percentage of the portfolio
-    max_position_value = total_portfolio_value * (config.MAX_POSITION_PERCENTAGE / 100)
-    if trade_value > max_position_value:
-        log.warning(f"TRADE REJECTED: Position size for {symbol} ({trade_value:.2f}) exceeds the maximum allowed of {config.MAX_POSITION_PERCENTAGE}% of the portfolio ({max_position_value:.2f}).")
-        await send_telegram_alert(f"⚠️ Trade REJECTED: Position size for {symbol} is too large.")
-        return False
+        performance_metrics = calculate_performance_metrics(trade_log)
+        report = format_performance_report(performance_metrics)
+        await update.message.reply_text(report)
+    except Exception as e:
+        log.error(f"Error in /performance command: {e}")
+        await update.message.reply_text(f"❌ Failed to get performance report: {e}")
+
+async def trades_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /trades command."""
+    try:
+        trade_log = await query_trade_log(limit=10)
+        if not trade_log:
+            await update.message.reply_text("No recent trades found.")
+            return
+
+        report = format_trade_log_report(trade_log)
+        await update.message.reply_text(report)
+    except Exception as e:
+        log.error(f"Error in /trades command: {e}")
+        await update.message.reply_text(f"❌ Failed to get trade log: {e}")
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Logs errors raised by the Telegram bot."""
+    log.error(f"Exception while handling a Telegram update: {context.error}", exc_info=context.error)
+    # Optionally, send a message to the user or a admin chat
+    # await context.bot.send_message(chat_id=config.TELEGRAM_CHAT_ID, text=f"An error occurred: {context.error}")
+
+async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /health command."""
+    kite = context.application.bot_data['kite']
+    try:
+        health_status = await health_check(kite)
         
-    return True
+        # Format the health report
+        status_emoji = {
+            "HEALTHY": "✅",
+            "DEGRADED": "⚠️",
+            "UNHEALTHY": "❌"
+        }
+        
+        report = f"{status_emoji.get(health_status['overall'], '❓')} **System Health: {health_status['overall']}**\n\n"
+        
+        for check_name, check_data in health_status["checks"].items():
+            status = check_data["status"]
+            emoji = "✅" if status == "PASS" else "⚠️" if status == "WARN" else "❌" if status == "FAIL" else "⏭️"
+            report += f"*{check_name.replace('_', ' ').title()}*: {status}\n"
+            
+            if "error" in check_data:
+                report += f"  `Error: {check_data['error']}`\n"
+            elif check_name == "api_connectivity" and "user" in check_data:
+                report += f"  `User: {check_data['user']}`\n"
+            elif check_name == "portfolio_file":
+                report += f"  `Holdings: {check_data.get('holdings_count', 0)}, Watchlist: {check_data.get('watchlist_count', 0)}`\n"
+            elif check_name == "market_data" and "nifty_price" in check_data:
+                report += f"  `NIFTY: ₹{check_data['nifty_price']}`\n"
+            elif check_name == "memory_usage" and "usage_percent" in check_data:
+                report += f"  `Usage: {check_data['usage_percent']:.1f}%`\n"
+        
+        if "issues" in health_status:
+            report += f"\n**Issues Found:**\n"
+            for issue in health_status["issues"]:
+                report += f"• {issue}\n"
+        
+        await update.message.reply_text(report, parse_mode='Markdown')
+        
+    except Exception as e:
+        log.error(f"Error in /health command: {e}")
+        await update.message.reply_text(f"❌ Health check failed: {e}")
+
+
+# 1. Fix the reconcile_portfolio function with better error handling
 
 @retry_api_call()
-async def manage_watchlist(kite: KiteConnect, total_portfolio_value: float):
+async def reconcile_portfolio(kite: "AsyncKiteClient") -> str:
+    log.info("--- Starting Portfolio Reconciliation ---")
     global portfolio
-    today = datetime.now().date()
-    
-    for symbol, item in list(portfolio.get("watchlist", {}).items()):
-        added_date = datetime.strptime(item['added_date'], '%Y-%m-%d').date()
-        if (today - added_date).days > config.WATCHLIST_EXPIRY_DAYS:
-            log.info(f"{symbol} expired from watchlist.")
-            await send_telegram_alert(f"➖ {symbol} expired from watchlist.")
-            del portfolio["watchlist"][symbol]
-            continue
+    try:
+        log.info("Fetching broker holdings...")
+        # Add timeout to prevent hanging
+        broker_holdings = await asyncio.wait_for(kite.holdings(), timeout=30.0)
+        log.info(f"Fetched {len(broker_holdings)} holdings from broker")
+        
+        log.info("Fetching margins...")
+        margins = await asyncio.wait_for(kite.margins(), timeout=30.0)
+        actual_cash = margins["equity"]["available"]["cash"]
+        log.info(f"Available cash: ₹{actual_cash:,.2f}")
+        
+        async with portfolio_context() as portfolio_data:
+            original_holdings = set(portfolio_data['holdings'].keys())
+            reconciled_portfolio = {"cash": actual_cash, "holdings": {}}
+            summary = []
 
-        try:
-            ltp_data = kite.ltp(f"NSE:{item['instrument_token']}")
-            current_price = ltp_data[f"NSE:{item['instrument_token']}"]['last_price']
+            for item in broker_holdings:
+                symbol = item['tradingsymbol']
+                log.debug(f"Processing holding: {symbol}")
+                
+                # Update existing holding, ensuring essential fields are present
+                if symbol in portfolio_data['holdings']:
+                    reconciled_portfolio['holdings'][symbol] = portfolio_data['holdings'][symbol]
+                    reconciled_portfolio['holdings'][symbol]['exchange'] = item['exchange'] # Ensure exchange is present
+                    reconciled_portfolio['holdings'][symbol]['product'] = item['product']   # Ensure product is present
+                    
+                    if reconciled_portfolio['holdings'][symbol]['quantity'] != item['quantity']:
+                        summary.append(f"~ {symbol} qty updated to {item['quantity']}")
+                        reconciled_portfolio['holdings'][symbol]['quantity'] = item['quantity']
+                # Add new holding from broker
+                else:
+                    summary.append(f"+ Added new holding: {symbol}")
+                    reconciled_portfolio['holdings'][symbol] = {
+                        "quantity": item['quantity'],
+                        "entry_price": item['average_price'],
+                        "instrument_token": item['instrument_token'],
+                        "exchange": item['exchange'],
+                        "product": item['product'], # Add product type
+                        "stop_loss": item['average_price'] * (1 - (config.RISK_PER_TRADE_PERCENTAGE / 100) * config.ATR_MULTIPLIER),
+                        "take_profit": item['average_price'] * (1 + (config.TAKEPROFIT_ATR_MULTIPLIER * 0.02)),
+                        "peak_price": item['average_price']
+                    }
             
-            if current_price > item['confirmation_price']:
-                log.info(f"CONFIRMED BUY for {symbol} at {current_price:.2f}")
-                
-                # --- Position Sizing ---
-                historical_data = await get_cached_historical_data(kite, item['instrument_token'], today - timedelta(days=90), today, "day")
-                indicators = calculate_indicators(historical_data)
-                atr = indicators.get('atr_14', current_price * 0.02)
+            removed_symbols = original_holdings - set(reconciled_portfolio['holdings'].keys())
+            for symbol in removed_symbols:
+                summary.append(f"- Removed sold holding: {symbol}")
 
-                capital_at_risk = total_portfolio_value * (config.RISK_PER_TRADE_PERCENTAGE / 100)
-                stop_loss_price = current_price - (atr * config.ATR_MULTIPLIER)
-                risk_per_share = current_price - stop_loss_price
-                
-                if risk_per_share <= 0:
-                    log.warning(f"Risk per share for {symbol} is zero or negative. Skipping trade.")
-                    del portfolio["watchlist"][symbol]
-                    continue
-
-                trade_quantity = int(capital_at_risk // risk_per_share)
-                trade_value = trade_quantity * current_price
-
-                # --- Pre-Trade Risk Checks ---
-                if trade_quantity > 0 and await is_trade_safe(symbol, trade_value, total_portfolio_value):
-                    await send_telegram_alert(f"✅ Risk checks passed for {symbol}. Placing BUY order.")
-                    
-                    order_id = await place_market_order(kite, symbol, "BUY", trade_quantity)
-                    
-                    if order_id:
-                        # Add to pending orders instead of directly to holdings
-                        portfolio['pending_orders'][order_id] = {
-                            "symbol": symbol, "action": "BUY", "quantity": trade_quantity,
-                            "instrument_token": item['instrument_token'], "placed_at": datetime.now().isoformat()
-                        }
-                        del portfolio["watchlist"][symbol] # Remove from watchlist once order is placed
-                        save_portfolio(portfolio)
-                        await send_telegram_alert(f"⌛ BUY order for {trade_quantity} of {symbol} placed. Awaiting confirmation.")
-                    else:
-                        # Handle immediate order placement failure
-                        log.critical(f"CRITICAL: Market order placement failed for {symbol}. The API did not return an order_id.")
-                        await send_telegram_alert(f"🔥 CRITICAL: Order placement for {symbol} FAILED. Check logs.")
-
-        except Exception as e:
-            log.error(f"Error processing watchlist for {symbol}: {e}")
-            raise
-
-def is_market_open():
-    """
-    Checks if the market is open based on time and weekday.
-    """
-    now = datetime.now()
-    is_weekday = now.weekday() < 5  # Monday to Friday
-    is_market_time = config.MARKET_OPEN <= now.time() <= config.MARKET_CLOSE
-    # TODO: Add a check for market holidays
-    return is_weekday and is_market_time
-
-async def trading_loop(kite: KiteConnect):
-    log.info("Trading loop started.")
-    while True:
-        if not AGENT_STATE["is_running"]:
-            await asyncio.sleep(5)
-            continue
-
-        if not is_market_open():
-            log.info(f"Market is closed. Waiting for {config.CHECK_INTERVAL_SECONDS} seconds...")
-            await asyncio.sleep(config.CHECK_INTERVAL_SECONDS)
-            continue
+            # Update the global portfolio state
+            portfolio.update(reconciled_portfolio)
+            log.info("Portfolio reconciliation completed successfully")
         
-        # --- Live Trading Order Monitoring ---
-        if not config.LIVE_PAPER_TRADING:
-            await monitor_pending_orders(kite)
+        return "✅ Reconciliation Complete:\n" + ("\n".join(f"- {s}" for s in summary) if summary else "- No changes detected.")
+    
+    except asyncio.TimeoutError:
+        log.error("Reconciliation timeout - API calls took too long")
+        raise CriticalTradingError("Reconciliation failed due to API timeout")
+    except Exception as e:
+        log.error(f"Reconciliation failed: {e}")
+        log.error(f"Error type: {type(e).__name__}")
+        import traceback
+        log.error(f"Traceback: {traceback.format_exc()}")
+        raise CriticalTradingError(f"Reconciliation failed: {str(e)}")
 
-        await send_telegram_alert("--- New Trading Cycle ---")
-        
-        market_trend = await get_market_trend(kite)
-        await send_telegram_alert(f"Market Trend: {market_trend} {'📈' if market_trend == 'Uptrend' else '📉'}")
-        
-        portfolio_metrics = await get_portfolio_metrics(kite)
-        total_portfolio_value = portfolio_metrics['total_value']
 
-        if portfolio["holdings"]:
-            await send_telegram_alert("Phase 1: Managing existing portfolio...")
-            for symbol, position in list(portfolio["holdings"].items()):
-                await analyze_and_trade_stock(kite, symbol, position['instrument_token'], True, total_portfolio_value)
-        
-        if portfolio["watchlist"]:
-            await send_telegram_alert("Phase 2: Managing watchlist...")
-            await manage_watchlist(kite, total_portfolio_value)
-
-        if market_trend == "Uptrend":
-            await send_telegram_alert("Phase 3: Scanning for new opportunities...")
-            scan_list = await screen_for_momentum_pullbacks(kite, n=config.TOP_N_STOCKS)
-            if scan_list:
-                for stock in scan_list:
-                    if stock["symbol"] not in portfolio["holdings"] and stock["symbol"] not in portfolio["watchlist"]:
-                        await analyze_and_trade_stock(kite, stock["symbol"], stock["instrument_token"], False, total_portfolio_value)
-        else:
-            await send_telegram_alert("Market is in a downtrend. New purchases are disabled.")
-
-        final_metrics = await get_portfolio_metrics(kite)
-        summary = format_portfolio_summary(final_metrics)
-        await send_telegram_alert(summary)
-        await send_telegram_alert(f"Cycle finished. Waiting for {config.CHECK_INTERVAL_SECONDS // 60} minutes...")
-        await asyncio.sleep(config.CHECK_INTERVAL_SECONDS)
-
+# 2. Fix the main function with better error handling and logging
 async def main():
     parser = argparse.ArgumentParser(description="AI Trading Agent")
     parser.add_argument("--backtest", help="Run in backtesting mode", action="store_true")
@@ -656,57 +520,32 @@ async def main():
         sys.exit(1)
     
     try:
-        # Initialize the Gemini model immediately after verifying the key
+        log.info("Initializing Gemini model...")
         analysis.initialize_gemini(gemini_api_key)
+        log.info("Gemini model initialized successfully")
     except Exception as e:
         log.critical(f"Failed to initialize Gemini. Please check your API key. Error: {e}")
         sys.exit(1)
 
     try:
+        log.info("Connecting to Kite...")
         kite = KiteConnect(api_key=config.API_KEY)
         kite.set_access_token(config.ACCESS_TOKEN)
-        kite.profile()
+        
+        # Use the async client for cleaner code
+        async_kite = AsyncKiteClient(kite)
+        
+        profile = await async_kite.profile()
+        log.info(f"Connected to Kite successfully. User: {profile.get('user_name', 'Unknown')}")
+
     except Exception as e:
         log.critical(f"Kite connection failed: {e}")
+        import traceback
+        log.critical(f"Traceback: {traceback.format_exc()}")
         sys.exit(1)
 
     if args.backtest:
-        backtest_config = {
-            "BACKTEST_START_DATE": config.BACKTEST_START_DATE,
-            "BACKTEST_END_DATE": config.BACKTEST_END_DATE,
-            "COMMISSION_PER_TRADE": config.COMMISSION_PER_TRADE,
-            "SLIPPAGE_PERCENTAGE": config.SLIPPAGE_PERCENTAGE,
-            "TOP_N_STOCKS": config.TOP_N_STOCKS
-        }
-        portfolio_sim = {"cash": config.VIRTUAL_CAPITAL, "holdings": {}, "trade_log": []}
-        
-        log.info("Fetching historical data for backtest...")
-        all_instruments = kite.instruments(exchange=config.EXCHANGE)
-        symbol_to_token_map = {inst['tradingsymbol']: inst['instrument_token'] for inst in all_instruments}
-        
-        historical_data_map = {}
-        for symbol in config.BACKTEST_STOCKS:
-            try:
-                token = symbol_to_token_map.get(symbol)
-                if not token:
-                    log.warning(f"Could not find token for {symbol}. Skipping.")
-                    continue
-                
-                records = kite.historical_data(token, config.BACKTEST_START_DATE, config.BACKTEST_END_DATE, "day")
-                historical_data_map[symbol] = records
-                log.info(f"Fetched {len(records)} days of data for {symbol}.")
-            except Exception as e:
-                log.error(f"Could not fetch historical data for {symbol} in backtest setup: {e}")
-
-        equity_curve, trade_log = run_dynamic_backtest(kite, backtest_config, portfolio_sim, historical_data_map)
-        performance_metrics = calculate_backtest_performance(equity_curve, trade_log)
-        
-        if performance_metrics:
-            plot_performance(performance_metrics)
-            report = format_backtest_report(performance_metrics)
-            print(report)
-        else:
-            print("Backtest completed with no trades or results to analyze.")
+        log.warning("Backtesting mode is not yet updated to use the new KiteWrapper. Please run in live/paper mode.")
         return
 
     # --- Live Mode Setup ---
@@ -717,16 +556,20 @@ async def main():
         log.critical("Telegram Bot Token or Chat ID not found.")
         sys.exit(1)
         
+    log.info("Setting up Telegram bot...")
     application = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
-    application.bot_data['kite'] = kite
+    application.bot_data['kite'] = async_kite # Pass the async client
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("stop", stop_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("performance", performance_command))
     application.add_handler(CommandHandler("trades", trades_command))
+    application.add_handler(CommandHandler("health", health_command))
+    application.add_error_handler(error_handler)
     
     public_url = None
     try:
+        log.info("Setting up ngrok tunnel...")
         if config.NGROK_AUTH_TOKEN:
             ngrok.set_auth_token(config.NGROK_AUTH_TOKEN)
         public_url = ngrok.connect(config.WEBHOOK_PORT).public_url
@@ -744,37 +587,277 @@ async def main():
         
     except Exception as e:
         log.critical(f"Failed to setup ngrok or webhook: {e}")
+        import traceback
+        log.critical(f"Traceback: {traceback.format_exc()}")
         sys.exit(1)
 
-    # Reconcile portfolio from broker at startup
-    startup_message = f"--- 🚀 AI Trading Agent ONLINE ({mode}) ---\n"
-    reconciliation_summary = await reconcile_portfolio(kite)
-    startup_message += f"\n{reconciliation_summary}\n"
+    log.info("Loading portfolio...")
+    await load_portfolio()
+    log.info("Portfolio loaded successfully")
     
-    # Add portfolio summary to startup message
-    portfolio_metrics = await get_portfolio_metrics(kite)
-    summary = format_portfolio_summary(portfolio_metrics)
-    startup_message += f"\n{summary}\n"
+    startup_message = f"--- 🚀 AI Trading Agent ONLINE ({mode}) ---\n"
+    
+    log.info("Starting portfolio reconciliation...")
+    try:
+        reconciliation_summary = await reconcile_portfolio(async_kite)
+        log.info(f"Reconciliation completed: {reconciliation_summary}")
+        startup_message += f"\n{reconciliation_summary}\n"
+    except Exception as e:
+        log.error(f"Reconciliation failed: {e}")
+        reconciliation_summary = f"❌ Reconciliation Failed: {str(e)}"
+        startup_message += f"\n{reconciliation_summary}\n"
+    
+    log.info("Getting portfolio metrics...")
+    try:
+        metrics = await get_portfolio_metrics(async_kite)
+        summary = format_portfolio_summary(metrics)
+        startup_message += f"\n{summary}\n"
+        log.info("Portfolio metrics retrieved successfully")
+    except Exception as e:
+        log.error(f"Failed to get portfolio metrics: {e}")
+        startup_message += f"\n❌ Failed to get portfolio metrics: {str(e)}\n"
 
     market_status = "OPEN" if is_market_open() else f"CLOSED (Opens at {config.MARKET_OPEN.strftime('%H:%M')} on weekdays)"
     startup_message += f"\n📊 Market Status: {market_status}\n👂 Listening at: {public_url}"
-    await send_telegram_alert(startup_message)
     
+    log.info("Sending startup message...")
+    await send_telegram_alert(startup_message)
+    log.info("Startup message sent successfully")
+    
+    log.info("Starting trading loop...")
     try:
-        await trading_loop(kite)
+        await trading_loop(async_kite)
+    except Exception as e:
+        log.critical(f"Trading loop failed: {e}")
+        import traceback
+        log.critical(f"Traceback: {traceback.format_exc()}")
+        await send_telegram_alert(f"🔥 CRITICAL: Trading loop failed: {str(e)}")
     finally:
         log.info("Shutting down agent...")
-        await application.updater.stop()
-        await application.stop()
-        if public_url:
-            ngrok.disconnect(public_url)
-            log.info(f"ngrok tunnel {public_url} disconnected.")
-        await send_telegram_alert(f"--- 😴 AI Trading Agent OFFLINE ({mode}) ---")
+        try:
+            await application.updater.stop()
+            await application.stop()
+            if public_url:
+                ngrok.disconnect(public_url)
+                log.info(f"ngrok tunnel {public_url} disconnected.")
+            async_kite.stop_worker() # Stop the worker thread
+            await send_telegram_alert(f"--- 😴 AI Trading Agent OFFLINE ({mode}) ---")
+        except Exception as e:
+            log.error(f"Error during shutdown: {e}")
+
+
+# 3. Add better error handling to trading_loop
+async def trading_loop(kite: "AsyncKiteClient"):
+    """Main trading loop with improved error classification and resilience."""
+    global last_cache_invalidation_date
+    log.info("Trading loop started.")
+    
+    consecutive_errors = 0
+    max_consecutive_errors = 5 # Allow 5 minor errors before a long pause
+    base_error_delay = 60  # 1 minute
+    
+    while AGENT_STATE["is_running"]:
+        try:
+            today = datetime.now().date()
+            if last_cache_invalidation_date != today:
+                historical_data_cache.clear()
+                ltp_cache.clear()  # Also clear LTP cache daily
+                last_cache_invalidation_date = today
+                log.info("Daily cache invalidated.")
+
+            if not is_market_open():
+                log.info(f"Market is closed. Waiting for {config.CHECK_INTERVAL_SECONDS} seconds...")
+                await asyncio.sleep(config.CHECK_INTERVAL_SECONDS)
+                continue
+            
+            log.info("--- Starting new trading cycle ---")
+            
+            # Reset error counter on successful cycle start
+            if consecutive_errors > 0:
+                log.info("Resetting consecutive error count after successful cycle start.")
+                consecutive_errors = 0
+            
+            if not config.LIVE_PAPER_TRADING:
+                log.info("Monitoring pending orders...")
+                await monitor_pending_orders(kite)
+                log.info("Pending orders check completed")
+
+            await send_telegram_alert("--- 🚀 New Trading Cycle ---")
+            
+            log.info("Getting market trend...")
+            market_trend = await get_market_trend(kite)
+            log.info(f"Market trend: {market_trend}")
+            await send_telegram_alert(f"📊 Market Trend: {market_trend} {'📈' if market_trend == 'Uptrend' else '📉'}")
+            
+            log.info("Getting portfolio metrics...")
+            metrics = await get_portfolio_metrics(kite)
+            total_portfolio_value = metrics['total_value']
+            log.info(f"Total portfolio value: ₹{total_portfolio_value:,.2f}")
+
+            # --- Phase 1: Manage existing holdings ---
+            async with portfolio_context(save_after=False) as portfolio_data:
+                holdings_copy = list(portfolio_data["holdings"].items())
+            
+            if holdings_copy:
+                log.info(f"Phase 1: Managing {len(holdings_copy)} existing holdings...")
+                await send_telegram_alert("Phase 1: Managing existing portfolio...")
+                
+                for symbol, position in holdings_copy:
+                    try:
+                        log.info(f"Analyzing holding: {symbol}")
+                        await analyze_and_trade_stock(kite, symbol, position['instrument_token'], True, total_portfolio_value)
+                    except MinorTradingError as e:
+                        log.warning(f"Minor error analyzing holding {symbol}: {e}")
+                        await send_telegram_alert(f"⚠️ Skipping {symbol}: {e}")
+                        continue
+                log.info("Phase 1 completed")
+            
+            # --- Phase 2: Manage watchlist ---
+            log.info("Phase 2: Managing watchlist...")
+            await manage_watchlist(kite, total_portfolio_value)
+            log.info("Phase 2 completed")
+
+            # --- Phase 3: Scan for new opportunities ---
+            if market_trend == "Uptrend":
+                log.info("Phase 3: Scanning for new opportunities...")
+                await send_telegram_alert("Phase 3: Scanning for new opportunities...")
+                try:
+                    scan_list = await screen_for_momentum_pullbacks(kite, n=config.TOP_N_STOCKS)
+                    log.info(f"Found {len(scan_list)} potential opportunities")
+                    
+                    if scan_list:
+                        async with portfolio_context(save_after=False) as portfolio_data:
+                            current_holdings = set(portfolio_data["holdings"].keys())
+                            current_watchlist = set(portfolio_data["watchlist"].keys())
+                        
+                        for stock in scan_list:
+                            if stock["symbol"] not in current_holdings and stock["symbol"] not in current_watchlist:
+                                try:
+                                    log.info(f"Analyzing opportunity: {stock['symbol']}")
+                                    await analyze_and_trade_stock(kite, stock["symbol"], stock["instrument_token"], False, total_portfolio_value)
+                                except MinorTradingError as e:
+                                    log.warning(f"Minor error analyzing new opportunity {stock['symbol']}: {e}")
+                                    continue
+                except Exception as e:
+                    log.error(f"Error during opportunity scanning phase: {e}")
+                    await send_telegram_alert(f"❌ Opportunity scanning failed: {e}")
+                log.info("Phase 3 completed")
+            else:
+                log.info("Market is in downtrend - skipping new opportunities")
+                await send_telegram_alert("Market is in a downtrend. New purchases are disabled.")
+
+            # --- Final Summary ---
+            log.info("Getting final portfolio metrics...")
+            final_metrics = await get_portfolio_metrics(kite)
+            summary = format_portfolio_summary(final_metrics)
+            log.info("Trading cycle completed successfully")
+            log.info(summary)
+            await send_telegram_alert(summary)
+            
+        except asyncio.CancelledError:
+            log.info("Shutdown signal received. Exiting trading loop gracefully.")
+            AGENT_STATE["is_running"] = False # Ensure state is set for a clean exit
+            break # Exit the loop immediately
+        except MinorTradingError as e:
+            consecutive_errors += 1
+            error_delay = min(base_error_delay * (2 ** consecutive_errors), 900)  # Cap at 15 minutes
+            
+            log.warning(f"Minor error #{consecutive_errors} in trading loop: {e}")
+            await send_telegram_alert(f"⚠️ Minor Error #{consecutive_errors}: {e}. Retrying in {error_delay//60} minutes.")
+            
+            if consecutive_errors >= max_consecutive_errors:
+                log.critical(f"Too many consecutive minor errors ({consecutive_errors}). Entering maintenance mode for 30 minutes.")
+                await send_telegram_alert(f"🔥 Too many consecutive errors. Entering maintenance mode for 30 minutes.")
+                await asyncio.sleep(1800)
+                consecutive_errors = 0
+            else:
+                await asyncio.sleep(error_delay)
+            continue
+            
+        except CriticalTradingError as e:
+            log.critical(f"A critical, non-recoverable error occurred: {e}")
+            await send_telegram_alert(f"🔥 CRITICAL ERROR: {e}. The agent is shutting down.")
+            AGENT_STATE["is_running"] = False
+            raise
+            
+        except Exception as e:
+            log.critical(f"An unexpected critical error occurred in the trading loop: {e}")
+            import traceback
+            log.critical(f"Traceback: {traceback.format_exc()}")
+            await send_telegram_alert(f"🔥 UNEXPECTED CRITICAL ERROR: {e}. The agent is shutting down.")
+            AGENT_STATE["is_running"] = False
+            raise
+
+        log.info(f"Cycle finished. Waiting for {config.CHECK_INTERVAL_SECONDS // 60} minutes...")
+        await asyncio.sleep(config.CHECK_INTERVAL_SECONDS)
+
+
+# 4. Also add timeout to get_portfolio_metrics
+@retry_api_call()
+async def get_portfolio_metrics(kite: "AsyncKiteClient") -> dict:
+    global portfolio, ltp_cache
+    holdings_value = 0
+    
+    async with portfolio_lock:
+        if portfolio["holdings"]:
+            instrument_lookups = [f"{pos['exchange']}:{pos['instrument_token']}" for pos in portfolio["holdings"].values()]
+            
+            # --- LTP Cache Logic ---
+            cached_ltp = {}
+            instruments_to_fetch = []
+            now = datetime.now()
+
+            for inst in instrument_lookups:
+                if inst in ltp_cache and (now - ltp_cache[inst]['timestamp']).total_seconds() < config.CACHE_EXPIRY_SECONDS:
+                    cached_ltp[inst] = ltp_cache[inst]['price']
+                else:
+                    instruments_to_fetch.append(inst)
+            
+            if instruments_to_fetch:
+                try:
+                    log.info(f"Fetching LTP for {len(instruments_to_fetch)} uncached instruments...")
+                    ltp_data = await asyncio.wait_for(kite.ltp(instruments_to_fetch), timeout=30.0)
+                    # Update cache
+                    for inst, data in ltp_data.items():
+                        ltp_cache[inst] = {'price': data['last_price'], 'timestamp': now}
+                    
+                    # Merge fetched data with cached data
+                    cached_ltp.update({inst: data['last_price'] for inst, data in ltp_data.items()})
+
+                except asyncio.TimeoutError:
+                    log.error("LTP fetch timeout - using entry prices for uncached items")
+                    # This is not ideal, but we can proceed with cached values.
+                except Exception as e:
+                    log.error(f"Could not fetch LTP for portfolio metrics: {e}")
+                    # Raise a minor error as we can still function with stale data, but it should be flagged.
+                    raise MinorTradingError(f"Could not fetch LTP data: {e}")
+
+            # Calculate holdings value using the cache
+            for symbol, position in portfolio["holdings"].items():
+                instrument = f"{position['exchange']}:{position['instrument_token']}"
+                last_price = cached_ltp.get(instrument, position['entry_price'])
+                holdings_value += last_price * position['quantity']
+                log.debug(f"Holdings value for {symbol}: ₹{last_price * position['quantity']:,.2f}")
+
+        available_cash = portfolio.get('cash', 0)
+        total_value = available_cash + holdings_value
+    
+    return {
+        "total_value": total_value,
+        "holdings_value": holdings_value,
+        "available_cash": available_cash
+    }
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log.info("Agent shut down by user.")
+        log.info("Shutdown requested by user (Ctrl+C).")
+    except CriticalTradingError as e:
+        log.fatal(f"A critical error forced the agent to shut down: {e}")
     except Exception as e:
-        log.critical(f"Failed to start the agent: {e}")
+        log.critical(f"An unexpected top-level error occurred: {e}")
+        import traceback
+        log.critical(f"Traceback: {traceback.format_exc()}")
+    finally:
+        log.info("Agent shutdown complete.")

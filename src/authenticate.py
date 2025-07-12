@@ -1,39 +1,44 @@
 import os
 import sys
+import asyncio
 from dotenv import load_dotenv
 from kiteconnect import KiteConnect
 
 # --- Robust Path Setup ---
-# This ensures the script finds the .env file in the project root directory
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
 dotenv_path = os.path.join(project_root, '.env')
 load_dotenv(dotenv_path=dotenv_path)
 # -------------------------
 
-# Get your API key and secret from environment variables
 api_key = os.getenv("KITE_API_KEY")
 api_secret = os.getenv("KITE_API_SECRET")
 
-def generate_access_token():
-    """Generates and saves the access token to the root .env file."""
+async def generate_access_token_async():
+    """Asynchronously generates and saves the access token."""
     if not api_key or not api_secret or "YOUR_API_KEY" in api_key:
         print("Error: KITE_API_KEY and KITE_API_SECRET must be set in the .env file.")
         return
 
     kite = KiteConnect(api_key=api_key)
     print(f"\nStep 1: Go to this URL and log in:\n{kite.login_url()}\n")
-    request_token = input("Step 2: Paste the request_token from the redirect URL here: ").strip()
+    
+    loop = asyncio.get_event_loop()
+    request_token = await loop.run_in_executor(
+        None, 
+        lambda: input("Step 2: Paste the request_token from the redirect URL here: ").strip()
+    )
 
     try:
-        data = kite.generate_session(request_token, api_secret=api_secret)
+        data = await loop.run_in_executor(
+            None,
+            lambda: kite.generate_session(request_token, api_secret=api_secret)
+        )
         access_token = data["access_token"]
 
-        # Read the existing .env file
         with open(dotenv_path, "r") as f:
             lines = f.readlines()
 
-        # Write back, updating the ACCESS_TOKEN if it exists, or appending it
         token_updated = False
         with open(dotenv_path, "w") as f:
             for line in lines:
@@ -43,7 +48,6 @@ def generate_access_token():
                 else:
                     f.write(line)
             if not token_updated:
-                # Ensure there's a newline before appending
                 if lines and not lines[-1].endswith('\n'):
                     f.write('\n')
                 f.write(f'ACCESS_TOKEN="{access_token}"\n')
@@ -55,4 +59,4 @@ def generate_access_token():
         print(f"\nAuthentication failed: {e}")
 
 if __name__ == "__main__":
-    generate_access_token()
+    asyncio.run(generate_access_token_async())

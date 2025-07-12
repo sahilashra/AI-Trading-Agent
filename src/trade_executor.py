@@ -3,6 +3,7 @@ from logger import log
 import random
 import string
 from utils import retry_api_call
+import asyncio
 
 @retry_api_call()
 async def place_market_order(kite: KiteConnect, symbol: str, transaction_type: str, quantity: int, variety: str = "regular"):
@@ -11,15 +12,19 @@ async def place_market_order(kite: KiteConnect, symbol: str, transaction_type: s
     The product type is hardcoded to CNC to prevent accidental intraday trades.
     """
     try:
-        order_id = kite.place_order(
-            tradingsymbol=symbol,
-            exchange="NSE",
-            transaction_type=transaction_type,
-            quantity=quantity,
-            product="CNC",  # Hardcoded for safety
-            order_type="MARKET",
-            validity="DAY",
-            variety=variety
+        loop = asyncio.get_event_loop()
+        order_id = await loop.run_in_executor(
+            None,
+            lambda: kite.place_order(
+                tradingsymbol=symbol,
+                exchange="NSE",
+                transaction_type=transaction_type,
+                quantity=quantity,
+                product="CNC",  # Hardcoded for safety
+                order_type="MARKET",
+                validity="DAY",
+                variety=variety
+            )
         )
         log.info(f"(LIVE) Placed {transaction_type} CNC order for {quantity} of {symbol}. Order ID: {order_id}")
         return order_id

@@ -61,3 +61,28 @@ WEBHOOK_PORT = 8080
 
 # --- PERFORMANCE & OPTIMIZATION ---
 CACHE_EXPIRY_SECONDS = 3600 # 1 hour
+
+# --- CONFIGURATION VALIDATION ---
+def validate_config():
+    """
+    Validates that all essential configuration variables are set.
+    Raises ValueError if a required variable is missing.
+    """
+    required_vars = [
+        "API_KEY", "ACCESS_TOKEN", "TELEGRAM_BOT_TOKEN", 
+        "TELEGRAM_CHAT_ID", "NGROK_AUTH_TOKEN"
+    ]
+    
+    missing_vars = [var for var in required_vars if not globals().get(var)]
+    
+    if missing_vars:
+        raise ValueError(f"Missing required configuration variables: {', '.join(missing_vars)}. Please set them in your .env file.")
+
+# --- Run validation on import ---
+try:
+    validate_config()
+except ValueError as e:
+    # Use a simple print here because the logger might not be initialized yet
+    print(f"CRITICAL CONFIGURATION ERROR: {e}")
+    import sys
+    sys.exit(1)
