@@ -14342,3 +14342,46 @@ message: "API key expired. Please renew the API key."
 2025-07-12 14:59:15,901 - INFO - Application.stop() complete
 2025-07-12 14:59:15,901 - INFO - Disconnecting tunnel: https://ca0d05f4fd63.ngrok-free.app
 2025-07-12 14:59:17,968 - CRITICAL - Failed to start the agent: ngrok client exception, URLError: [WinError 10061] No connection could be made because the target machine actively refused it
+2025-07-12 15:05:13,592 - INFO - --- Initializing AI Trading Agent ---
+2025-07-12 15:05:13,597 - INFO - Gemini model initialized successfully.
+2025-07-12 15:05:13,749 - INFO - --- Starting in PAPER TRADING mode ---
+2025-07-12 15:05:16,072 - INFO - Updating authtoken for default "config_path" of "ngrok_path": C:\Users\muham\AppData\Local\ngrok\ngrok.exe
+2025-07-12 15:05:16,178 - INFO - Opening tunnel named: http-8080-cf35183e-a4e2-4cec-be28-793b6280faea
+2025-07-12 15:05:16,260 - INFO - t=2025-07-12T15:05:16+0530 lvl=info msg="no configuration paths supplied"
+2025-07-12 15:05:16,261 - INFO - t=2025-07-12T15:05:16+0530 lvl=info msg="using configuration at default config path" path=C:\\Users\\muham\\AppData\\Local/ngrok/ngrok.yml
+2025-07-12 15:05:16,262 - INFO - t=2025-07-12T15:05:16+0530 lvl=info msg="open config file" path=C:\\Users\\muham\\AppData\\Local\\ngrok\\ngrok.yml err=nil
+2025-07-12 15:05:16,382 - INFO - t=2025-07-12T15:05:16+0530 lvl=info msg="starting web service" obj=web addr=127.0.0.1:4040 allow_hosts=[]
+2025-07-12 15:05:17,296 - INFO - t=2025-07-12T15:05:17+0530 lvl=info msg="client session established" obj=tunnels.session
+2025-07-12 15:05:17,297 - INFO - t=2025-07-12T15:05:17+0530 lvl=info msg="tunnel session started" obj=tunnels.session
+2025-07-12 15:05:17,375 - INFO - t=2025-07-12T15:05:17+0530 lvl=info msg=start pg=/api/tunnels id=419278c9ab026d1f
+2025-07-12 15:05:17,376 - INFO - t=2025-07-12T15:05:17+0530 lvl=info msg=end pg=/api/tunnels id=419278c9ab026d1f status=200 dur=510µs
+2025-07-12 15:05:17,377 - INFO - t=2025-07-12T15:05:17+0530 lvl=info msg=start pg=/api/tunnels id=a63c398804128aa6
+2025-07-12 15:05:17,379 - INFO - t=2025-07-12T15:05:17+0530 lvl=info msg=end pg=/api/tunnels id=a63c398804128aa6 status=200 dur=0s
+2025-07-12 15:05:17,385 - INFO - t=2025-07-12T15:05:17+0530 lvl=info msg=start pg=/api/tunnels id=c40d8b5d7acabc60
+2025-07-12 15:05:17,390 - INFO - t=2025-07-12T15:05:17+0530 lvl=info msg=end pg=/api/tunnels id=c40d8b5d7acabc60 status=200 dur=653.8µs
+2025-07-12 15:05:17,392 - INFO - t=2025-07-12T15:05:17+0530 lvl=info msg=start pg=/api/tunnels id=9b86ac7e7da8422c
+2025-07-12 15:05:17,672 - INFO - t=2025-07-12T15:05:17+0530 lvl=info msg="started tunnel" obj=tunnels name=http-8080-cf35183e-a4e2-4cec-be28-793b6280faea addr=http://localhost:8080 url=https://68f89e716803.ngrok-free.app
+2025-07-12 15:05:17,673 - INFO - t=2025-07-12T15:05:17+0530 lvl=info msg=end pg=/api/tunnels id=9b86ac7e7da8422c status=201 dur=280.2096ms
+2025-07-12 15:05:17,673 - INFO - ngrok tunnel established: https://68f89e716803.ngrok-free.app
+2025-07-12 15:05:18,308 - INFO - HTTP Request: POST https://api.telegram.org/bot7621196498:AAECB-bp4g9V_5jPV_CmWzow65sJao1QNq4/getMe "HTTP/1.1 200 OK"
+2025-07-12 15:05:18,523 - INFO - HTTP Request: POST https://api.telegram.org/bot7621196498:AAECB-bp4g9V_5jPV_CmWzow65sJao1QNq4/setWebhook "HTTP/1.1 200 OK"
+2025-07-12 15:05:18,647 - INFO - Application started
+2025-07-12 15:05:18,648 - INFO - Telegram bot started with webhook.
+2025-07-12 15:05:18,648 - INFO - --- Reconciling Portfolio ---
+2025-07-12 15:05:18,772 - INFO - Portfolio saved to D:\Projects\gemini-cli\ai_trading_agent\src\papertrading_portfolio.json
+2025-07-12 15:05:20,561 - INFO - HTTP Request: POST https://api.telegram.org/bot7621196498:AAECB-bp4g9V_5jPV_CmWzow65sJao1QNq4/sendMessage "HTTP/1.1 200 OK"
+2025-07-12 15:05:20,562 - INFO - Successfully sent Telegram alert.
+2025-07-12 15:05:20,571 - INFO - Trading loop started.
+2025-07-12 15:05:20,572 - INFO - Market is closed. Waiting for 300 seconds...
+2025-07-12 15:05:20,915 - INFO - t=2025-07-12T15:05:20+0530 lvl=info msg="join connections" obj=join id=493162565ab9 l=127.0.0.1:8080 r=149.154.161.248:37676
+2025-07-12 15:05:34,826 - INFO - t=2025-07-12T15:05:34+0530 lvl=info msg="received stop request" obj=app stopReq="{err:<nil> restart:false}"
+2025-07-12 15:05:34,828 - INFO - Shutting down agent...
+2025-07-12 15:05:34,828 - INFO - t=2025-07-12T15:05:34+0530 lvl=info msg="session closing" obj=tunnels.session err=nil
+2025-07-12 15:05:34,829 - INFO - t=2025-07-12T15:05:34+0530 lvl=info msg="accept failed" obj=tunnels.session obj=csess id=7b774bba7e02 err="reconnecting session closed"
+2025-07-12 15:05:34,830 - INFO - t=2025-07-12T15:05:34+0530 lvl=info msg="no more state changes" obj=tunnels.session
+2025-07-12 15:05:34,831 - INFO - t=2025-07-12T15:05:34+0530 lvl=info msg="failed to accept connection: Listener closed" obj=tunnels.session clientid=0da76ad6a8a62a04d113bd8e905b3352
+2025-07-12 15:05:34,832 - INFO - Application is stopping. This might take a moment.
+2025-07-12 15:05:34,833 - WARNING - t=2025-07-12T15:05:34+0530 lvl=warn msg="Stopping forwarder" name=http-8080-cf35183e-a4e2-4cec-be28-793b6280faea acceptErr="failed to accept connection: Listener closed"
+2025-07-12 15:05:34,833 - INFO - Application.stop() complete
+2025-07-12 15:05:34,834 - INFO - Disconnecting tunnel: https://68f89e716803.ngrok-free.app
+2025-07-12 15:05:36,870 - CRITICAL - Failed to start the agent: ngrok client exception, URLError: [WinError 10061] No connection could be made because the target machine actively refused it
