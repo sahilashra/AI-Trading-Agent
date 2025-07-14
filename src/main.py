@@ -188,56 +188,96 @@ async def analyze_and_trade_stock(kite: "AsyncKiteClient", symbol: str, instrume
     try:
         log.info(f"--- Analyzing {symbol} ---")
         
-        # 1. Get Historical Data & News
+        # 1. Get Historical Data, Indicators & News
         from_date = datetime.now() - timedelta(days=90)
         to_date = datetime.now()
         
         historical_data = await kite.historical_data(instrument_token, from_date, to_date, "day")
         
-        if not historical_data:
-            log.warning(f"No historical data for {symbol}")
+        # FIX 1: Add data length check to prevent analysis on stocks with insufficient history
+        if not historical_data or len(historical_data) < 50:
+            log.warning(f"Not enough historical data for {symbol} (need 50 days). Skipping analysis.")
             return
 
+        indicators = calculate_indicators(historical_data)
         df = pd.DataFrame(historical_data)
-        df = calculate_indicators(df)
-        
         news_items = get_financial_news(symbol)
         
-        # 2. Get AI Analysis
-        ai_decision = await analysis.get_ai_trading_decision(df, news_items, is_existing_holding)
+        # FIX 2: Enhance the prompt with strategy context
+        prompt = f"""You are an expert trading analyst. Your goal is to identify high-probability momentum pullback opportunities.
+
+**Strategy: Momentum Pullback**
+1.  **Identify Momentum:** The stock is already in a long-term uptrend (Price > 50-day SMA).
+2.  **Identify Pullback:** The stock has experienced a short-term dip, making for a good entry point (RSI is not overbought, ideally below 55-60).
+3.  **News Catalyst:** Positive news can be a strong confirmation.
+
+**Analysis for: {symbol}**
+
+**Current Situation:**
+- This is {'an existing holding in the portfolio' if is_existing_holding else 'a new stock selected for its high momentum'}.
+
+**Technical Indicators:**
+- Price: {df['close'].iloc[-1]:.2f}
+- 50-Day SMA: {indicators.sma_50 or 'N/A'} (Status: {'Above' if indicators.sma_50 and df['close'].iloc[-1] > indicators.sma_50 else 'Below'})
+- RSI(14): {indicators.rsi_14 or 'N/A'} (Status: {'Good for entry' if indicators.rsi_14 and indicators.rsi_14 < 55 else 'Potentially overbought/neutral'})
+- MACD Line vs Signal: {indicators.macd_line or 'N/A'} vs {indicators.macd_signal or 'N/A'}
+
+**Recent News Headlines:**
+"""
+        if news_items:
+            for headline in news_items:
+                prompt += f"- {headline}\n"
+        else:
+            prompt += "- No recent news found.\n"
+
+        prompt += """
+**Your Decision:**
+Given that the stock shows strong momentum and is currently in a pullback, is this a 'BUY' opportunity? Or should we 'HOLD' and wait for a better signal, or 'SELL' if it's an existing position with weakening signs?
+
+Respond with only one word: BUY, SELL, or HOLD.
+"""
+        loop = asyncio.get_event_loop()
+        ai_decision = await loop.run_in_executor(None, analysis.get_market_analysis, prompt)
         
-        log.info(f"AI Decision for {symbol}: {ai_decision['decision']}")
-        await send_telegram_alert(f"AI ({symbol}): {ai_decision['decision']}\nReason: {ai_decision['reason']}")
+        log.info(f"AI Decision for {symbol}: {ai_decision}")
+        await send_telegram_alert(f"AI ({symbol}): {ai_decision}")
 
         # 3. Execute Trade based on AI decision
         if config.LIVE_PAPER_TRADING:
-            if ai_decision['decision'] == 'BUY':
-                # --- Position Sizing ---
-                cash_to_allocate = portfolio['cash'] * (config.MAX_POSITION_PERCENTAGE / 100)
+            if ai_decision == 'BUY':
+                async with portfolio_context(save_after=False) as portfolio_data:
+                    cash_to_allocate = portfolio_data['cash'] * (config.MAX_POSITION_PERCENTAGE / 100)
                 price = df['close'].iloc[-1]
                 quantity = int(cash_to_allocate / price)
-                
                 if quantity > 0:
                     await place_paper_order(symbol, "BUY", quantity, price)
                 else:
                     log.warning(f"Not enough cash to buy {symbol}")
-
-            elif ai_decision['decision'] == 'SELL' and is_existing_holding:
-                quantity = portfolio['holdings'][symbol]['quantity']
+            elif ai_decision == 'SELL' and is_existing_holding:
+                async with portfolio_context(save_after=False) as portfolio_data:
+                    quantity = portfolio_data['holdings'][symbol]['quantity']
                 price = df['close'].iloc[-1]
                 await place_paper_order(symbol, "SELL", quantity, price)
-        else:
-            # --- LIVE TRADING LOGIC (not implemented) ---
-            log.warning("Live trading is not yet implemented.")
+        else: # This is for LIVE trading
+            if ai_decision == 'BUY':
+                async with portfolio_context(save_after=False) as portfolio_data:
+                    cash_to_allocate = portfolio_data['cash'] * (config.MAX_POSITION_PERCENTAGE / 100)
+                price = df['close'].iloc[-1]
+                quantity = int(cash_to_allocate / price)
+                if quantity > 0:
+                    await place_market_order(kite, symbol, "BUY", quantity)
+                else:
+                    log.warning(f"Not enough cash to buy {symbol}")
+            elif ai_decision == 'SELL' and is_existing_holding:
+                async with portfolio_context(save_after=False) as portfolio_data:
+                    quantity = portfolio_data['holdings'][symbol]['quantity']
+                await place_market_order(kite, symbol, "SELL", quantity)
 
     except (ConnectionError, asyncio.TimeoutError) as e:
-        # Network-related errors are often transient and should be treated as minor.
         log.warning(f"Network error while analyzing {symbol}: {e}")
         raise MinorTradingError(f"Network error analyzing {symbol}: {e}")
     except Exception as e:
         log.error(f"An unexpected error occurred in analyze_and_trade_stock for {symbol}: {e}")
-        # Re-raise as a minor error so the main loop can decide how to handle it.
-        # This prevents a single stock from crashing the entire agent.
         raise MinorTradingError(f"Failed to analyze {symbol}: {e}")
 
 async def manage_watchlist(kite: "AsyncKiteClient", total_portfolio_value: float):
@@ -274,49 +314,75 @@ async def manage_watchlist(kite: "AsyncKiteClient", total_portfolio_value: float
 
 async def screen_for_momentum_pullbacks(kite: "AsyncKiteClient", n: int) -> list:
     """
-    Scans for stocks exhibiting momentum with a recent pullback.
+    Scans a broad universe of stocks for top momentum performers,
+    then checks those top performers for a pullback entry signal.
     """
     try:
-        log.info(f"Screening top {n} stocks for momentum pullbacks...")
-        # This is a placeholder for a more sophisticated stock screener
-        # In a real scenario, you would use a service like Streak or define a
-        # universe of stocks to scan. For now, we'll use a predefined list.
+        log.info(f"Dynamically screening for top {n} momentum stocks...")
         
-        scan_list = []
-        for symbol in config.BACKTEST_STOCKS[:n]:
+        # Use the full list of stocks as our universe to scan
+        universe = config.BACKTEST_STOCKS 
+        
+        all_instruments = await kite.instruments(exchange=config.EXCHANGE)
+        instrument_map = {item['tradingsymbol']: item for item in all_instruments}
+
+        async def get_momentum(symbol):
+            instrument = instrument_map.get(symbol)
+            if not instrument:
+                return None
+            
             try:
-                # This is inefficient and should be optimized in a real system
-                instrument = (await kite.instruments(exchange=config.EXCHANGE, tradingsymbol=symbol))[0]
-                
-                from_date = datetime.now() - timedelta(days=100)
+                # Fetch last 90 days of data to ensure we have enough for all indicators
+                from_date = datetime.now() - timedelta(days=90)
                 to_date = datetime.now()
-                
                 data = await kite.historical_data(instrument['instrument_token'], from_date, to_date, "day")
                 
-                if not data:
-                    continue
+                if len(data) < 50: # Stricter check for 50-day SMA
+                    return None
 
                 df = pd.DataFrame(data)
-                df = calculate_indicators(df) # From technical_analysis.py
-
-                # --- Basic Momentum Pullback Strategy ---
-                # 1. Price is above the 50-day SMA (Uptrend)
-                # 2. RSI is below 50 (Pullback)
-                if df['SMA_50'].iloc[-1] < df['close'].iloc[-1] and df['RSI_14'].iloc[-1] < 50:
-                    scan_list.append({
-                        "symbol": symbol,
-                        "instrument_token": instrument['instrument_token']
-                    })
-                    log.info(f"Found potential opportunity: {symbol}")
-
-            except Exception as e:
-                log.warning(f"Could not screen {symbol}: {e}")
-                continue
+                # Calculate 1-month (approx 22 trading days) percentage change
+                price_one_month_ago = df['close'].iloc[-22]
+                current_price = df['close'].iloc[-1]
+                momentum = ((current_price - price_one_month_ago) / price_one_month_ago) * 100
                 
+                return {"symbol": symbol, "instrument_token": instrument['instrument_token'], "momentum": momentum, "full_data": data}
+            except Exception as e:
+                log.warning(f"Could not fetch momentum data for {symbol}: {e}")
+                return None
+
+        # Concurrently fetch momentum for all stocks in the universe
+        momentum_tasks = [get_momentum(symbol) for symbol in universe]
+        all_momentum_data = await asyncio.gather(*momentum_tasks)
+        
+        # Filter out failures and sort by momentum
+        valid_stocks = [s for s in all_momentum_data if s is not None]
+        top_performers = sorted(valid_stocks, key=lambda x: x['momentum'], reverse=True)[:n]
+        
+        log.info(f"Top {len(top_performers)} momentum stocks: {[s['symbol'] for s in top_performers]}")
+
+        # --- Now, check these top performers for a pullback ---
+        scan_list = []
+        for stock in top_performers:
+            try:
+                indicators = calculate_indicators(stock['full_data'])
+                df = pd.DataFrame(stock['full_data'])
+
+                # Pullback Strategy: Price > 50-SMA and RSI < 50
+                if indicators.sma_50 and indicators.rsi_14 and df['close'].iloc[-1] > indicators.sma_50 and indicators.rsi_14 < 50:
+                    scan_list.append({
+                        "symbol": stock["symbol"],
+                        "instrument_token": stock["instrument_token"]
+                    })
+                    log.info(f"Found potential pullback opportunity in top performer: {stock['symbol']}")
+            except Exception as e:
+                log.warning(f"Could not analyze pullback for {stock['symbol']}: {e}")
+                continue
+        
         return scan_list
 
     except Exception as e:
-        log.error(f"Error in screen_for_momentum_pullbacks: {e}")
+        log.error(f"Error in dynamic screen_for_momentum_pullbacks: {e}")
         return []
 
 
@@ -451,7 +517,7 @@ async def reconcile_portfolio(kite: "AsyncKiteClient") -> str:
         
         log.info("Fetching margins...")
         margins = await asyncio.wait_for(kite.margins(), timeout=30.0)
-        actual_cash = margins["equity"]["available"]["cash"]
+        actual_cash = margins["equity"]["available"]["live_balance"]
         log.info(f"Available cash: ₹{actual_cash:,.2f}")
         
         summary = []

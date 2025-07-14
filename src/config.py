@@ -5,7 +5,7 @@ from datetime import datetime, time as dt_time
 # --- DEPLOYMENT & MODE ---
 # Set to True to run in live paper trading mode (uses live data, simulates trades)
 # Set to False for live trading with real money
-LIVE_PAPER_TRADING = True
+LIVE_PAPER_TRADING = False
 
 # --- PATHS ---
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

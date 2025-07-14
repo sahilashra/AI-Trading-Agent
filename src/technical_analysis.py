@@ -9,13 +9,15 @@ def calculate_indicators(historical_data: list) -> CalculatedIndicators:
     """
     # 1. Validate the incoming raw data
     validated_candles = validate_historical_data(historical_data)
+    
+    # Add a check to ensure there's enough data for the longest SMA (50)
     if not validated_candles or len(validated_candles) < 50:
         log.warning("Not enough valid historical data to calculate all indicators.")
         return CalculatedIndicators()
 
     try:
         # Convert the validated Pydantic objects back to a list of dicts for pandas
-        df_data = [candle.dict() for candle in validated_candles]
+        df_data = [candle.model_dump() for candle in validated_candles]
         df = pd.DataFrame(df_data)
 
         # Ensure the 'close' column is numeric
