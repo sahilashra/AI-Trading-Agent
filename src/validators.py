@@ -24,6 +24,7 @@ class CalculatedIndicators(BaseModel):
     rsi_14: Optional[float] = None
     sma_20: Optional[float] = None
     sma_50: Optional[float] = None
+    ema_5: Optional[float] = None
     macd_line: Optional[float] = None
     macd_signal: Optional[float] = None
     bb_upper: Optional[float] = None
@@ -55,11 +56,22 @@ def validate_indicators(data: dict) -> CalculatedIndicators:
         # Return an empty model on failure
         return CalculatedIndicators()
 
+# --- AI Model Validation ---
+
+class AIDecision(BaseModel):
+    """
+    Validates the structured response from the AI model.
+    """
+    decision: str = Field(..., pattern=r"^(BUY|SELL|HOLD)$") # Must be one of these
+    confidence: int = Field(..., ge=1, le=10) # Confidence score from 1 to 10
+    reasoning: str = Field(..., min_length=10) # Must provide some reasoning
+
 # --- Portfolio Validation ---
 
 class Holding(BaseModel):
     quantity: int = Field(ge=0)
-    entry_price: float = Field(ge=0) # Allow zero entry price
+    entry_price: float = Field(ge=0)
+    purchase_date: Optional[date] = None # Date the holding was purchased
     instrument_token: int
     exchange: str
     product: str

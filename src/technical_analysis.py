@@ -27,6 +27,7 @@ def calculate_indicators(historical_data: list) -> CalculatedIndicators:
         df.ta.rsi(length=14, append=True)
         df.ta.sma(length=20, append=True)
         df.ta.sma(length=50, append=True)
+        df.ta.ema(length=5, append=True) # Add 5-day EMA
         df.ta.macd(append=True)
         df.ta.bbands(length=20, append=True)
         df.ta.atr(length=14, append=True)
@@ -36,6 +37,7 @@ def calculate_indicators(historical_data: list) -> CalculatedIndicators:
             "rsi_14": float(round(df['RSI_14'].iloc[-1], 2)) if pd.notna(df['RSI_14'].iloc[-1]) else None,
             "sma_20": float(round(df['SMA_20'].iloc[-1], 2)) if pd.notna(df['SMA_20'].iloc[-1]) else None,
             "sma_50": float(round(df['SMA_50'].iloc[-1], 2)) if pd.notna(df['SMA_50'].iloc[-1]) else None,
+            "ema_5": float(round(df['EMA_5'].iloc[-1], 2)) if pd.notna(df['EMA_5'].iloc[-1]) else None,
             "macd_line": float(round(df['MACD_12_26_9'].iloc[-1], 2)) if pd.notna(df['MACD_12_26_9'].iloc[-1]) else None,
             "macd_signal": float(round(df['MACDs_12_26_9'].iloc[-1], 2)) if pd.notna(df['MACDs_12_26_9'].iloc[-1]) else None,
             "bb_upper": float(round(df['BBU_20_2.0'].iloc[-1], 2)) if pd.notna(df['BBU_20_2.0'].iloc[-1]) else None,
