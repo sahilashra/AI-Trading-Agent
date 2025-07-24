@@ -4,6 +4,15 @@ import json
 from contextlib import asynccontextmanager
 from logger import log
 import config # Import config to get file paths
+from datetime import date
+
+# --- Custom JSON Encoder ---
+class DateEncoder(json.JSONEncoder):
+    """A custom JSON encoder to handle date objects."""
+    def default(self, obj):
+        if isinstance(obj, date):
+            return obj.isoformat()
+        return super().default(obj)
 
 # --- Application State ---
 AGENT_STATE = {"is_running": True}
@@ -34,7 +43,7 @@ async def _save_portfolio_nolock(data):
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(
             None,
-            lambda: json.dump(data, open(portfolio_file, 'w'), indent=4)
+            lambda: json.dump(data, open(portfolio_file, 'w'), indent=4, cls=DateEncoder)
         )
     except Exception as e:
         log.error(f"Error saving portfolio file: {e}")
@@ -49,3 +58,6 @@ async def portfolio_context(portfolio_data: dict, save_after=True):
             if save_after:
                 # The portfolio_data object is modified in place, so we save it.
                 await _save_portfolio_nolock(portfolio_data)
+
+if __name__ == '__main__':
+    log.info("This module is intended to be imported, not run directly.")

@@ -15,14 +15,16 @@ load_dotenv(dotenv_path=dotenv_path)
 import config
 from logger import log
 from alerter import send_telegram_alert
+from llm_clients import FAIL_SAFE_DECISION
 import analysis
-from trade_executor import place_market_order, place_paper_order
-from screener import get_dynamic_universe
+from trade_executor import place_and_confirm_order, place_paper_order
+from screener import get_top_opportunities
 from trade_logger import trade_logger 
 from technical_analysis import calculate_indicators
 from utils import AsyncKiteClient, retry_api_call
 from errors import CriticalTradingError, MinorTradingError, DataValidationError
 from validators import AIDecision, validate_portfolio_data
+from position_reviewer import review_open_positions
 from state import (
     portfolio_context, AGENT_STATE, historical_data_cache, 
     ltp_cache, last_cache_invalidation_date, trade_cooldown_list
@@ -32,6 +34,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from pyngrok import ngrok
 import pytz
+import time
 
 # --- Portfolio Management ---
 
@@ -81,7 +84,7 @@ async def load_portfolio():
 def format_cycle_summary(cycle_activity: dict, metrics: dict) -> str:
     """Formats a detailed summary of the trading cycle for a Telegram message."""
     
-    summary_lines = ["---  Trading Cycle Report ---"]
+    summary_lines = ["--- Trading Cycle Report ---"]
     
     # Trade activity
     trades_made = cycle_activity.get("trades", [])
@@ -96,7 +99,8 @@ def format_cycle_summary(cycle_activity: dict, metrics: dict) -> str:
     holds = cycle_activity.get("holds", [])
     if holds:
         summary_lines.append(f"\nHeld Positions: {len(holds)}")
-        summary_lines.append(f"  - {', '.join(holds)}")
+        for symbol, reason in holds:
+            summary_lines.append(f"  - {symbol}: {reason}")
         
     # Skipped trades
     skipped = cycle_activity.get("skipped", {})
@@ -216,16 +220,16 @@ def is_market_open():
     if now.weekday() >= 5: return False
     return config.MARKET_OPEN <= now.time() <= config.MARKET_CLOSE
 
-async def analyze_and_trade_stock(kite: AsyncKiteClient, portfolio: dict, symbol: str, instrument_token: int, is_existing: bool) -> str:
+async def analyze_and_trade_stock(kite: AsyncKiteClient, portfolio: dict, symbol: str, instrument_token: int, is_existing: bool) -> tuple[str, str]:
     """
     Analyzes a stock and executes a trade if conditions are met.
-    Returns a status string indicating the outcome.
+    Returns a tuple of (status, reason).
     """
     try:
         log.info(f"Analyzing {'existing holding' if is_existing else 'opportunity'}: {symbol}")
         
         # Initialize a default analysis object. This will be overridden by TSL or AI.
-        ai_analysis = analysis.FAIL_SAFE_DECISION
+        ai_analysis = FAIL_SAFE_DECISION
         tsl_triggered_sell = False
 
         from_date = datetime.now() - timedelta(days=90)
@@ -233,8 +237,7 @@ async def analyze_and_trade_stock(kite: AsyncKiteClient, portfolio: dict, symbol
         historical_data = await kite.historical_data(instrument_token, from_date, to_date, "day")
 
         if len(historical_data) < 50:
-            log.warning(f"Skipping {symbol} due to insufficient historical data.")
-            return "SKIPPED_NO_DATA"
+            return "SKIPPED", "Insufficient historical data"
 
         indicators = calculate_indicators(historical_data)
         df = pd.DataFrame(historical_data)
@@ -246,12 +249,14 @@ async def analyze_and_trade_stock(kite: AsyncKiteClient, portfolio: dict, symbol
                 position = p_data['holdings'].get(symbol)
                 if position:
                     # Check for minimum holding period before any sell action
-                    purchase_date = position.get('purchase_date')
-                    if purchase_date:
+                    purchase_date_str = position.get('purchase_date')
+                    if purchase_date_str and isinstance(purchase_date_str, str):
+                        purchase_date = datetime.fromisoformat(purchase_date_str).date()
                         holding_days = (datetime.now().date() - purchase_date).days
                         if holding_days < config.MIN_HOLDING_DAYS:
-                            log.info(f"Holding {symbol} for {holding_days} days (less than min {config.MIN_HOLDING_DAYS}). Skipping sell analysis.")
-                            return "HOLD_MIN_PERIOD"
+                            reason = f"Holding for {holding_days} days (min {config.MIN_HOLDING_DAYS})"
+                            log.info(f"{reason}. Skipping sell analysis for {symbol}.")
+                            return "HOLD", reason
 
                     if 'peak_price' not in position or position['peak_price'] is None:
                         position['peak_price'] = position.get('entry_price', price)
@@ -263,18 +268,15 @@ async def analyze_and_trade_stock(kite: AsyncKiteClient, portfolio: dict, symbol
                     # Calculate the trailing stop-loss price using ATR
                     if not indicators.atr_14 or indicators.atr_14 <= 0:
                         log.warning(f"Cannot calculate TSL for {symbol} due to invalid ATR. Skipping TSL check.")
-                        return "SKIPPED_NO_ATR"
+                        return "SKIPPED", "Invalid ATR for TSL"
                         
                     tsl_price = position['peak_price'] - (indicators.atr_14 * config.ATR_MULTIPLIER)
                     
                     # Check if the current price has breached the trailing stop
                     if price < tsl_price:
-                        log.info(f"Trailing stop-loss triggered for {symbol} at {price:.2f} (TSL: {tsl_price:.2f})")
-                        ai_analysis = AIDecision(
-                            decision="SELL", 
-                            confidence=10, 
-                            reasoning=f"Trailing stop-loss triggered at {tsl_price:.2f}"
-                        )
+                        reason = f"Trailing stop-loss triggered at {tsl_price:.2f}"
+                        log.info(f"{reason} for {symbol}")
+                        ai_analysis = AIDecision(decision="SELL", confidence=10, reasoning=reason)
                         tsl_triggered_sell = True
         
         # --- AI Decision Making (only if TSL hasn't already decided to sell) ---
@@ -299,12 +301,13 @@ async def analyze_and_trade_stock(kite: AsyncKiteClient, portfolio: dict, symbol
             - Is Existing Holding: {is_existing}
             """
             
-            ai_analysis = await asyncio.get_event_loop().run_in_executor(None, analysis.get_market_analysis, prompt)
+            ai_analysis = await analysis.get_market_analysis(prompt)
             log.info(f"AI Analysis for {symbol}: Decision={ai_analysis.decision}, Confidence={ai_analysis.confidence}, Reasoning='{ai_analysis.reasoning}'")
     
             if ai_analysis.confidence < 7:
-                log.info(f"Skipping trade for {symbol} due to low AI confidence ({ai_analysis.confidence}).")
-                return f"SKIPPED_LOW_CONFIDENCE ({ai_analysis.confidence})"
+                reason = f"Low AI confidence ({ai_analysis.confidence})"
+                log.info(f"Skipping trade for {symbol} due to {reason}.")
+                return "SKIPPED", reason
         
         # --- Trade Execution ---
         if config.LIVE_PAPER_TRADING:
@@ -315,14 +318,13 @@ async def analyze_and_trade_stock(kite: AsyncKiteClient, portfolio: dict, symbol
                     quantity = int(cash_to_allocate / price) if price > 0 else 0
                     if quantity > 0:
                         await place_paper_order(p_data, symbol, "BUY", quantity, price, instrument_token)
-                        # Update peak price on buy
                         if symbol in p_data['holdings']:
                             p_data['holdings'][symbol]['peak_price'] = price
                         trade_logger.log_trade(symbol, "BUY", quantity, price, reason=ai_analysis.reasoning)
                         await send_telegram_alert(f"✅ (Paper) Bought {quantity} of {symbol}")
-                        return "BOUGHT"
+                        return "BOUGHT", ai_analysis.reasoning
                     else:
-                        return "SKIPPED_INSUFFICIENT_CASH"
+                        return "SKIPPED", "Insufficient cash"
 
             elif ai_analysis.decision == 'SELL' and is_existing:
                 async with portfolio_context(portfolio, save_after=True) as p_data:
@@ -334,56 +336,48 @@ async def analyze_and_trade_stock(kite: AsyncKiteClient, portfolio: dict, symbol
                         trade_logger.log_trade(symbol, "SELL", quantity, price, pnl=pnl, reason=ai_analysis.reasoning)
                         trade_cooldown_list.add(symbol)
                         await send_telegram_alert(f"✅ (Paper) Sold {quantity} of {symbol}. P&L: ₹{pnl:,.2f}")
-                        return "SOLD"
+                        return "SOLD", ai_analysis.reasoning
         
         else: # --- Live Trading Logic ---
             metrics = await get_portfolio_metrics(kite, portfolio)
             
             if ai_analysis.decision == 'BUY':
                 if not indicators.atr_14 or indicators.atr_14 <= 0:
-                    log.warning(f"Cannot calculate position size for {symbol} due to invalid ATR. Skipping.")
-                    return "SKIPPED_NO_ATR"
+                    return "SKIPPED", "Invalid ATR for risk calculation"
 
                 stop_loss_price = price - (indicators.atr_14 * config.ATR_MULTIPLIER)
                 risk_per_share = price - stop_loss_price
                 
                 if risk_per_share <= 0:
-                    log.warning(f"Risk per share is zero or negative for {symbol}. Cannot size position. Skipping.")
-                    return "SKIPPED_RISK_CALC"
+                    return "SKIPPED", "Risk per share is zero or negative"
 
-                # --- Risk and Capital Allocation ---
                 risk_amount = metrics["total_value"] * (config.RISK_PER_TRADE_PERCENTAGE / 100)
                 quantity_by_risk = int(risk_amount / risk_per_share)
                 
                 capital_per_trade = metrics["total_value"] * (config.MAX_CAPITAL_PER_TRADE_PERCENTAGE / 100)
                 quantity_by_capital = int(capital_per_trade / price)
-
-                # Use the more conservative of the two quantities
                 quantity = min(quantity_by_risk, quantity_by_capital)
-                
-                # --- Sanity and Affordability Checks ---
                 trade_value = quantity * price
                 
                 if quantity <= 0:
-                    log.info(f"Calculated quantity for {symbol} is 0. No trade placed.")
-                    return "SKIPPED_RISK_CALC"
+                    return "SKIPPED", "Calculated quantity is 0"
                 if trade_value > metrics["available_cash"]:
-                    log.warning(f"Insufficient cash for {symbol}. Need ₹{trade_value:,.2f}, have ₹{metrics['available_cash']:,.2f}. Skipping.")
-                    return "SKIPPED_INSUFFICIENT_CASH"
+                    return "SKIPPED", f"Insufficient cash (needs ₹{trade_value:,.2f})"
 
                 log.info(f"Placing BUY for {quantity} of {symbol} with SL at {stop_loss_price:.2f}")
-                order_id = await place_market_order(kite, symbol, "BUY", quantity)
+                result = await place_and_confirm_order(kite, symbol, "BUY", quantity)
                 
-                # After reconciliation, set the peak price and purchase date for the new holding
-                await reconcile_portfolio(kite, portfolio)
-                async with portfolio_context(portfolio, save_after=True) as p_data:
-                    if symbol in p_data['holdings']:
-                        p_data['holdings'][symbol]['peak_price'] = price
-                        p_data['holdings'][symbol]['purchase_date'] = datetime.now().date().isoformat()
-
-                trade_logger.log_trade(symbol, "BUY", quantity, price, reason=ai_analysis.reasoning)
-                await send_telegram_alert(f"✅ Placed BUY for {quantity} of {symbol}. ID: {order_id}")
-                return "BOUGHT"
+                if result.status in ["COMPLETE", "PARTIAL"]:
+                    await reconcile_portfolio(kite, portfolio)
+                    async with portfolio_context(portfolio, save_after=True) as p_data:
+                        if symbol in p_data['holdings']:
+                            p_data['holdings'][symbol]['peak_price'] = price
+                            p_data['holdings'][symbol]['purchase_date'] = datetime.now().date().isoformat()
+                    trade_logger.log_trade(symbol, "BUY", result.filled_quantity, result.average_price, reason=ai_analysis.reasoning)
+                    await send_telegram_alert(f"✅ Placed BUY for {result.filled_quantity} of {symbol}. ID: {result.order_id}")
+                    return "BOUGHT", ai_analysis.reasoning
+                else:
+                    return "FAILED", f"BUY order failed with status: {result.status}"
 
             elif ai_analysis.decision == 'SELL' and is_existing:
                 async with portfolio_context(portfolio, save_after=False) as p_data:
@@ -392,110 +386,109 @@ async def analyze_and_trade_stock(kite: AsyncKiteClient, portfolio: dict, symbol
                         entry_price = p_data['holdings'][symbol]['entry_price']
                         pnl = (price - entry_price) * quantity
                         log.info(f"Placing SELL for {quantity} of {symbol}.")
-                        order_id = await place_market_order(kite, symbol, "SELL", quantity)
-                        trade_logger.log_trade(symbol, "SELL", quantity, price, pnl=pnl, reason=ai_analysis.reasoning)
-                        trade_cooldown_list.add(symbol)
-                        await send_telegram_alert(f"✅ Placed SELL for {quantity} of {symbol}. P&L: ₹{pnl:,.2f}. ID: {order_id}")
-                        await reconcile_portfolio(kite, portfolio)
-                        return "SOLD"
-            else:
-                return "HOLD"
+                        result = await place_and_confirm_order(kite, symbol, "SELL", quantity)
+                        
+                        if result.status in ["COMPLETE", "PARTIAL"]:
+                            trade_logger.log_trade(symbol, "SELL", result.filled_quantity, result.average_price, pnl=pnl, reason=ai_analysis.reasoning)
+                            trade_cooldown_list.add(symbol)
+                            await send_telegram_alert(f"✅ Placed SELL for {result.filled_quantity} of {symbol}. P&L: ₹{pnl:,.2f}. ID: {result.order_id}")
+                            await reconcile_portfolio(kite, portfolio)
+                            return "SOLD", ai_analysis.reasoning
+                        else:
+                            return "FAILED", f"SELL order failed with status: {result.status}"
+            
+            return "HOLD", ai_analysis.reasoning
 
     except Exception as e:
         log.error(f"Error analyzing {symbol}: {e}", exc_info=True)
-        return "ERROR"
-    return "HOLD" # Default return if no other path is taken
+        return "ERROR", str(e)
+    
+    return "HOLD", "Default action" # Default return if no other path is taken
 
 async def screen_for_opportunities(kite: AsyncKiteClient) -> list:
     """
-    Scans for new trading opportunities, either from a dynamic screener or a static list.
+    Scans for new trading opportunities using the intelligent screener.
     """
-    log.info("Screening for new opportunities...")
+    log.info("Screening for top 5 new opportunities...")
     
-    candidate_stocks = []
     if config.DYNAMIC_SCREENING:
-        candidate_stocks = await get_dynamic_universe(kite)
+        # This now returns the top 5 ranked opportunities directly
+        return await get_top_opportunities(kite, top_n=5)
     else:
-        # Fallback to the static list if dynamic screening is disabled
+        # Fallback for static list remains simple, but we could enhance it too.
+        # For now, it will just return the list without ranking.
         all_instruments = await kite.instruments(exchange="NSE")
         instrument_map = {item['tradingsymbol']: item for item in all_instruments}
+        opportunities = []
         for symbol in config.BACKTEST_STOCKS:
             if symbol in instrument_map:
-                candidate_stocks.append({
+                opportunities.append({
                     "symbol": symbol,
                     "instrument_token": instrument_map[symbol]['instrument_token']
                 })
-
-    opportunities = []
-    for stock in candidate_stocks:
-        try:
-            from_date = datetime.now() - timedelta(days=90)
-            to_date = datetime.now()
-            data = await kite.historical_data(stock['instrument_token'], from_date, to_date, "day")
-            
-            if len(data) < 50: continue
-
-            indicators = calculate_indicators(data)
-            df = pd.DataFrame(data)
-            
-            # --- Opportunity Filtering ---
-            # Find stocks that are in an uptrend but are currently in a pullback
-            if df['close'].iloc[-1] > indicators.sma_50 and indicators.rsi_14 < 55:
-                opportunities.append(stock)
-                log.info(f"Found opportunity: {stock['symbol']}")
-
-        except Exception as e:
-            log.warning(f"Could not screen {stock['symbol']}: {e}")
-            await asyncio.sleep(0.1) # Pause to avoid overwhelming the API
-
-    log.info(f"Screening complete. Found {len(opportunities)} potential opportunities.")
-    return opportunities
+        return opportunities
 
 async def trading_loop(kite: AsyncKiteClient, portfolio: dict):
+    last_review_time = datetime.now() - timedelta(seconds=config.POSITION_REVIEW_INTERVAL_SECONDS) # Ensure it runs on first cycle
+
     while AGENT_STATE["is_running"]:
+        if not is_market_open():
+            log.info("Market is closed. Sleeping for 1 minute.")
+            await asyncio.sleep(60)
+            continue
+
         log.info("--- New Trading Cycle ---")
-        log.info(f"Starting cycle with cash: ₹{portfolio['cash']:,.2f}")
-        
         cycle_activity = {"trades": [], "skipped": {}, "holds": []}
 
-        if trade_cooldown_list:
-            log.info(f"Clearing cooldown list: {', '.join(trade_cooldown_list)}")
-            trade_cooldown_list.clear()
+        # Phase 1: Active Position Review (at defined interval)
+        if config.ENABLE_POSITION_REVIEW and (datetime.now() - last_review_time).total_seconds() >= config.POSITION_REVIEW_INTERVAL_SECONDS:
+            await review_open_positions(kite, portfolio)
+            last_review_time = datetime.now()
 
-        # Phase 1: Manage Holdings
+        # Phase 2: Manage Holdings (TSL and AI-based)
         async with portfolio_context(portfolio, save_after=False) as p_data:
             holdings_copy = list(p_data["holdings"].items())
+        
         if holdings_copy:
             log.info(f"Managing {len(holdings_copy)} holdings...")
             for symbol, position in holdings_copy:
-                status = await analyze_and_trade_stock(kite, portfolio, symbol, position['instrument_token'], True)
+                if 'instrument_token' not in position:
+                    log.warning(f"Skipping analysis for {symbol} due to missing instrument_token.")
+                    continue
+                
+                status, reason = await analyze_and_trade_stock(kite, portfolio, symbol, position['instrument_token'], True)
+                
                 if status in ["BOUGHT", "SOLD"]:
                     cycle_activity["trades"].append(f"{status} {symbol}")
                 elif status == "HOLD":
-                    cycle_activity["holds"].append(symbol)
+                    cycle_activity["holds"].append((symbol, reason))
 
-        # Phase 2: Find & Analyze New Opportunities
+        # Phase 3: Find & Analyze New Opportunities
         opportunities = await screen_for_opportunities(kite)
         if opportunities:
             async with portfolio_context(portfolio, save_after=False) as p_data:
                 current_holdings = set(p_data["holdings"].keys())
+            
             for stock in opportunities:
                 if stock["symbol"] not in current_holdings and stock["symbol"] not in trade_cooldown_list:
-                    status = await analyze_and_trade_stock(kite, portfolio, stock["symbol"], stock["instrument_token"], False)
-                    if "SKIPPED" in status:
-                        reason = status.split('_', 1)[1]
+                    status, reason = await analyze_and_trade_stock(kite, portfolio, stock["symbol"], stock["instrument_token"], False)
+                    
+                    if status == "SKIPPED":
                         if reason not in cycle_activity["skipped"]:
                             cycle_activity["skipped"][reason] = []
                         cycle_activity["skipped"][reason].append(stock["symbol"])
                     elif status in ["BOUGHT", "SOLD"]:
                          cycle_activity["trades"].append(f"{status} {stock['symbol']}")
+                    
+                    time.sleep(2) # Add a 2-second delay to respect API rate limits
 
-        # Phase 3: Report Cycle Summary
+        # Phase 4: Report Cycle Summary
         metrics = await get_portfolio_metrics(kite, portfolio)
         summary_message = format_cycle_summary(cycle_activity, metrics)
         log.info(summary_message)
         await send_telegram_alert(summary_message)
         
+        log.info(f"--- Cycle Complete. Sleeping for {config.CHECK_INTERVAL_SECONDS} seconds. ---")
         await asyncio.sleep(config.CHECK_INTERVAL_SECONDS)
 
 # --- Main Application ---
@@ -504,21 +497,18 @@ async def main():
     """The main entry point for the AI Trading Agent."""
     log.info("--- Initializing AI Trading Agent ---")
     
-    kite = None
-    application = None
-    
     try:
         # --- Initialization ---
-        analysis.initialize_gemini(os.getenv("GEMINI_API_KEY"))
+        analysis.initialize_llm_client()
         kite = AsyncKiteClient(KiteConnect(api_key=config.API_KEY, access_token=config.ACCESS_TOKEN))
         await kite.profile()
         portfolio = await load_portfolio()
 
-        # --- Telegram & Ngrok Setup ---
+        # --- Telegram Setup for Alerts ---
+        # We only need the bot object to send messages, not the full application
+        # for the main trading loop, which simplifies shutdown.
         application = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
-        application.bot_data.update({'kite': kite, 'portfolio': portfolio})
-        # Add handlers here if needed
-
+        
         # --- Startup Message ---
         mode = "PAPER" if config.LIVE_PAPER_TRADING else "LIVE"
         startup_message = f"--- ✅ AI Trading Agent ONLINE ({mode}) ---\n"
@@ -526,7 +516,6 @@ async def main():
             startup_message += await reconcile_portfolio(kite, portfolio)
         
         metrics = await get_portfolio_metrics(kite, portfolio)
-        # Create a simple summary for startup, as the detailed one is for cycles
         portfolio_summary = f"--- Portfolio ---\nCash: ₹{metrics['available_cash']:,.2f}\nHoldings: {metrics['holdings_count']}"
         startup_message += f"\n{portfolio_summary}"
         
@@ -535,21 +524,26 @@ async def main():
         # --- Start Trading Loop ---
         await trading_loop(kite, portfolio)
 
-    except CriticalTradingError as e:
-        log.critical(f"A critical error occurred: {e}")
+    except (CriticalTradingError, asyncio.CancelledError) as e:
+        log.warning(f"Agent is shutting down. Reason: {type(e).__name__}")
     except Exception as e:
-        log.critical(f"An unexpected error occurred in main: {e}", exc_info=True)
+        log.critical(f"An unexpected critical error occurred in main: {e}", exc_info=True)
+        await send_telegram_alert(f"🚨 CRITICAL ERROR: Agent shutting down. Reason: {e}")
     finally:
         # --- Graceful Shutdown ---
         log.info("Initiating agent shutdown...")
-        if application:
-            await application.stop()
-            log.info("Telegram application stopped.")
+        # No need to stop the application object as it's not running a loop
         
         # Disconnect ngrok tunnel if it's running
-        # This part requires ngrok to be managed within the application's scope
-        # For now, manual stop or letting the process end is the fallback.
-        
+        try:
+            tunnels = ngrok.get_tunnels()
+            if tunnels:
+                log.info("Disconnecting all ngrok tunnels...")
+                ngrok.disconnect()
+                log.info("Ngrok tunnels disconnected.")
+        except Exception as ngrok_e:
+            log.error(f"Error during ngrok disconnection: {ngrok_e}")
+            
         log.info("Agent shutdown complete.")
 
 

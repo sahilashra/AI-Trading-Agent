@@ -4,6 +4,7 @@ from typing import List, Optional, Dict
 from datetime import date
 from logger import log
 from errors import DataValidationError
+import config
 
 class HistoricalDataCandle(BaseModel):
     """
@@ -31,18 +32,37 @@ class CalculatedIndicators(BaseModel):
     bb_lower: Optional[float] = None
     atr_14: Optional[float] = None
 
-def validate_historical_data(data: List[dict]) -> List[HistoricalDataCandle]:
+def validate_historical_data(data: List[dict], symbol: str = "N/A") -> List[HistoricalDataCandle]:
     """
-    Validates a list of historical data candles.
+    Validates a list of historical data candles, including sanity checks.
     Filters out any invalid records.
     """
     validated_data = []
+    last_close = None
+
     for item in data:
         try:
-            validated_data.append(HistoricalDataCandle.parse_obj(item))
+            candle = HistoricalDataCandle.parse_obj(item)
+            
+            # --- Sanity Checks ---
+            # 1. Price change check (if we have a previous day's close)
+            if last_close:
+                price_change_pct = abs((candle.close - last_close) / last_close) * 100
+                if price_change_pct > config.MAX_DAY_PRICE_CHANGE_PERCENT:
+                    log.error(f"[DATA_QUALITY_FLAG] Unrealistic daily price change for {symbol} on {candle.date}. Change: {price_change_pct:.2f}%. Discarding candle.")
+                    continue # Skip this invalid candle
+            
+            # 2. Volume check
+            if candle.volume == 0:
+                log.warning(f"[DATA_QUALITY_FLAG] Zero volume recorded for {symbol} on {candle.date}.")
+
+            validated_data.append(candle)
+            last_close = candle.close
+
         except ValidationError as e:
-            log.warning(f"Skipping invalid historical data record: {item}. Error: {e}")
+            log.warning(f"[DATA_QUALITY_FLAG] Skipping invalid historical data record for {symbol}: {item}. Error: {e}")
             continue
+            
     return validated_data
 
 def validate_indicators(data: dict) -> CalculatedIndicators:
@@ -71,13 +91,16 @@ class AIDecision(BaseModel):
 class Holding(BaseModel):
     quantity: int = Field(ge=0)
     entry_price: float = Field(ge=0)
-    purchase_date: Optional[date] = None # Date the holding was purchased
+    purchase_date: Optional[date] = None
     instrument_token: int
     exchange: str
     product: str
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
-    peak_price: Optional[float] = None
+    # Fields for Position Reviewer
+    peak_price: Optional[float] = 0.0
+    last_peak_date: Optional[date] = None
+
 
 class WatchlistItem(BaseModel):
     instrument_token: int
