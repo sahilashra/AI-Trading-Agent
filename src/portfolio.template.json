@@ -1,0 +1,14 @@
+{
+  "cash": 100000,
+  "holdings": {},
+  "watchlist": {
+    "GOOGL": {
+      "instrument_token": "GOOGL",
+      "exchange": "NASDAQ"
+    },
+    "AAPL": {
+      "instrument_token": "AAPL",
+      "exchange": "NASDAQ"
+    }
+  }
+}

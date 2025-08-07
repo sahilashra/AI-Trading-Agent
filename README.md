@@ -1,8 +1,8 @@
 # AI Trading Agent
 
-**This is an experimental project. Trading in financial markets involves substantial risk. You are solely responsible for any financial decisions and potential losses. It is highly recommended to run this agent in a paper trading environment before deploying it with real capital.**
+A sophisticated, AI-powered swing trading agent designed to operate on the Indian stock market (NSE). It uses a Large Language Model (LLM) for its core trading decisions, is integrated with the Zerodha Kite API for live data and trade execution, and is fully controllable via a Telegram bot.
 
-This is a sophisticated, AI-powered swing trading agent designed to operate on the Indian stock market (NSE). It uses a Large Language Model (LLM) for its core trading decisions and is integrated with the Zerodha Kite API for live data and trade execution. The agent is fully controllable via a Telegram bot and is built with a focus on reliability, transparency, and advanced risk management.
+**This is an experimental project. Trading in financial markets involves substantial risk. You are solely responsible for any financial decisions and potential losses. It is highly recommended to run this agent in a paper trading environment before deploying it with real capital.**
 
 ## Core Trading Strategy
 
@@ -17,34 +17,67 @@ The agent employs a multi-layered swing trading strategy designed to identify an
     - **Active Position Review**: The agent doesn't just "set and forget." It periodically re-evaluates all open positions for signs of weakness, such as technical reversals, price stagnation, or simply being held for too long (time-stop).
     - **Confirmation-Based Take-Profit**: To avoid selling too early, the agent requires two conditions to be met: the stock must be overbought (RSI > 70) **and** show price weakness.
 
-## Key Features
+## System Architecture
 
-- **Advanced Risk Management:**
-  - **ATR-Based Trailing Stop-Loss**: Dynamically adjusts the stop-loss based on market volatility.
-  - **Active Position Review**: Periodically re-evaluates open trades for technical reversals, stagnation, or time-based exits.
-  - **Risk-Based Position Sizing**: Calculates position size based on a fixed percentage of portfolio risk.
-  - **Capital Allocation Limits**: Prevents over-concentration by limiting the capital allocated to a single trade.
+The agent is designed for resilience and transparency. The core logic is a trading loop that, when the market is open, reviews existing positions, manages holdings, and finds new opportunities.
 
-- **High Reliability & Resilience:**
-  - **Resilient API Key Rotation**: Automatically rotates between multiple API keys (for supported providers like Gemini) to bypass daily free tier limits and ensure uninterrupted operation.
-  - **Execution Acknowledgement**: Confirms every order with the broker, handling partial fills and rejections to ensure the internal portfolio state is always accurate.
-  - **Data Quality Assurance**: Incoming market data is validated for staleness and sanity to prevent bad data from causing flawed trades.
-  - **Circuit Breaker:** Automatically halts API calls to a failing broker service to allow for graceful recovery.
-  - **Graceful Shutdown & Startup:** Shuts down cleanly and is resilient to corrupted state files.
+```mermaid
+graph TD
+    subgraph "Core Application"
+        A[User starts main.py] --> B{Validate Config}
+        B -- ✅ Valid --> C[Initialize Services]
+        C --> D((Trading Loop))
+    end
 
-- **Full Transparency & Control:**
-  - **Real-Time CLI Dashboard**: A dedicated dashboard (`dashboard.py`) provides a live, read-only view of your portfolio, open positions, and recent log activity.
-  - **Broker Reconciliation Tool**: A standalone script (`reconcile.py`) to compare the agent's trade log against your official broker statement to guarantee accuracy.
-  - **Detailed Cycle Reports**: At the end of each cycle, the agent sends a detailed summary to Telegram, reporting trades made, positions held (with reasons), and opportunities skipped.
-  - **Comprehensive Logging**: Every action, decision, and error is logged for complete auditability.
+    subgraph "Services & State"
+        S1[state.py]
+        S2[errors.py]
+        S3[circuit_breaker.py]
+        S4[logger.py]
+        S5[validators.py]
+        S6[analysis.py: Key Manager]
+    end
+    
+    C --> S1; C --> S2; C --> S3; C --> S4; C --> S5; C --> S6;
 
-- **High-Fidelity Backtesting & Benchmarking:**
-  - **AI vs. Rules-Only Benchmarking**: The backtester can be run in a "rules-only" mode to provide a clear benchmark, allowing you to scientifically measure the true value and "alpha" that the LLM is providing over a simple mechanical strategy.
-  - **Professional Performance Analytics**: Generates a full suite of analytics including Sharpe Ratio, Sortino Ratio, Max Drawdown, Win Rate, and Expectancy per trade.
-  - **Realistic Cost Modeling**: Simulates advanced, tiered commission structures and variable, volatility-based slippage.
-  - **Survivorship Bias Protection**: The engine is structured to allow for the use of historical index constituents, preventing survivorship bias.
+    subgraph "Main Trading Cycle"
+        D --> F{Is Market Open?}
+        F -- Yes --> P1[Phase 1: Position Review]
+        P1 --> P2[Phase 2: Manage Holdings]
+        P2 --> P3[Phase 3: Find Opportunities]
+        P3 --> K[Log & Report Summary]
+        K --> D
+        F -- No --> D
+    end
 
-## Setup and Installation
+    subgraph "Opportunity Funnel (Phase 3)"
+        P3 --> QS[screener.py: Quantitative Filter]
+        QS --> |All Candidates| RS[screener.py: Rank & Score]
+        RS --> |Top 5| AN[analysis.py: LLM Analysis]
+    end
+
+    subgraph "Data & Execution Layer"
+        MD[market_data.py]
+        TE[trade_executor.py]
+        KITE[Broker API]
+        GEMINI[Gemini API]
+    end
+    
+    P1 --> MD; P2 --> MD; QS --> MD;
+    AN --> |API Call| GEMINI
+    S6 --> |Rotates Key| GEMINI
+    AN --> TE
+    TE -->|Place & Confirm| KITE
+    
+    subgraph "User Interaction"
+        U[User]
+    end
+    
+    U -->|Telegram| D
+    D -->|Telegram| U
+```
+
+## Getting Started
 
 ### 1. Prerequisites
 - Python 3.10+
@@ -74,9 +107,8 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Configuration
-
-Create a file named `.env` in the root directory of the project (`ai_trading_agent/`) and add the following:
+### 5. Configure Environment Variables
+Create a file named `.env` in the root directory and add the following, replacing the placeholder values with your actual credentials.
 
 ```env
 # Zerodha Kite API Credentials
@@ -103,7 +135,7 @@ TELEGRAM_CHAT_ID="your_telegram_chat_id"
 
 The agent's strategy and risk parameters can be fine-tuned in `src/config.py`.
 
-## Running the Agent
+## Usage
 
 ### 1. Authenticate with Broker (Daily)
 Run the authentication script and follow the prompts. This will save your `access_token` to the `.env` file.
